@@ -61,6 +61,24 @@ die()  { printf '%serror:%s %s\n' "$RED" "$R" "$*" >&2; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Every path this script keeps is absolute.
+#
+# A relative one survives as far as the first `ln -s`, where it is written into
+# the link verbatim and then resolved against the *link's* directory rather than
+# against the working directory it was typed in — a skill link that silently
+# points at nothing. The same relative path reaches the PATH advice at the end,
+# where a `.`-relative entry runs whatever happens to be in the current
+# directory. Neither is recoverable later, so nothing is stored relative.
+#
+# Does not require the path to exist: --src names a directory yet to be cloned.
+absolute() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    "") printf '' ;;
+    *)  printf '%s/%s' "$(pwd)" "${1#./}" ;;
+  esac
+}
+
 # Confirmation for something that was actually done. In a dry run the `would:`
 # lines already narrate the plan, so a ✓ on top of them would just be a lie.
 did()  { if [ "$DRY_RUN" -eq 0 ]; then ok "$@"; fi; }
@@ -254,7 +272,7 @@ resolve_source() {
       return
     fi
   fi
-  SRC="${SRC_DIR_ARG:-$(default_src_dir)}"
+  SRC="$(absolute "${SRC_DIR_ARG:-$(default_src_dir)}")"
   SRC_MODE="clone"
 }
 
@@ -646,6 +664,9 @@ if [ -n "$PROJECT_DIR" ]; then
   [ -d "$PROJECT_DIR" ] || die "no such directory: $PROJECT_DIR"
   PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 fi
+
+PREFIX="$(absolute "$PREFIX")"
+SRC_DIR_ARG="$(absolute "$SRC_DIR_ARG")"
 
 if [ "$STATIC" -eq 1 ] && [ "$(uname -s)" = "Darwin" ]; then
   die "--static builds a Linux musl binary and cannot be used on macOS"
