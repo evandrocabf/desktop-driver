@@ -256,8 +256,13 @@ is_checkout() {
     [ -f "$1/skills/$SKILL_NAME/SKILL.md" ]
 }
 
+# A subdirectory, not the namespace itself: `desktop session` keeps the agent's
+# private home at $XDG_DATA_HOME/desktop-driver/home, so cloning over the parent
+# either refuses to run — on any machine where a session came first — or, worse,
+# succeeds and leaves the agent's browser profile living inside a git working
+# tree, where `git status` reports it and `git clean -xfd` deletes it.
 default_src_dir() {
-  echo "${XDG_DATA_HOME:-$HOME/.local/share}/desktop-driver"
+  echo "${XDG_DATA_HOME:-$HOME/.local/share}/desktop-driver/checkout"
 }
 
 resolve_source() {
