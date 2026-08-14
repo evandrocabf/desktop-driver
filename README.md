@@ -322,10 +322,19 @@ application onto it, reads its accessibility tree and captures the screen:
 | Ubuntu 24.04 | ✓ | ✓ | ✓ | ✓ |
 | Arch | ✓ | ✓ | ✓ | ✓ |
 | openSUSE Tumbleweed | ✓ | ✓ | ✓ | ✓ |
-| macOS | compiles and lints only | — | — | — |
+| macOS 14 | ✓ | refused, as it should be | — | — |
 
 The Linux rows are containers with no systemd, no desktop and no login session,
 which is a harsher environment than a real machine and the same one CI runs in.
+
+The macOS row is a CI runner, and it is deliberately narrow. What it proves is
+that the binary builds and links for real, that `info`, `capabilities` and
+`doctor` answer with no permission granted — the state a fresh machine is in —
+and that `session start` refuses rather than half-working, since macOS has no
+mechanism to give an agent a display of its own. What it does not prove is the
+part that needs a human: **no snapshot, click or capture has ever run against a
+real Mac application**, because all three need a TCC grant that cannot be
+approved unattended. Treat the macOS backend as unverified where it matters.
 
 ### One binary for every distribution
 

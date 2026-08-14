@@ -115,6 +115,24 @@ impl PlatformProbe for LinuxProbe {
 /// works, but a human chooses.
 #[must_use]
 pub fn capabilities_for(info: &BackendInfo) -> CapabilitySet {
+    capabilities_from(info, &crate::session::missing_requirements())
+}
+
+/// The same mapping, with the one input that does not come from `info`.
+///
+/// Every capability above is a function of which backends were selected.
+/// Agent sessions are the exception: they need `Xvfb`, a window manager and a
+/// D-Bus daemon *installed on the host*, which no `BackendInfo` describes. That
+/// was read from the filesystem inside the mapping, which made the whole
+/// function depend on the machine it ran on — so the table-driven tests below
+/// passed on a developer's desktop and failed on a bare runner with none of
+/// those packages, which is the honest answer for that machine and the wrong
+/// question for a unit test.
+///
+/// Taking it as an argument keeps the mapping pure and leaves
+/// [`capabilities_for`] as the one place that looks at the host.
+#[must_use]
+pub fn capabilities_from(info: &BackendInfo, missing_session_helpers: &[&str]) -> CapabilitySet {
     let mut set = CapabilitySet::new();
 
     let a11y_present = info.accessibility != Backend::None;
@@ -195,16 +213,16 @@ pub fn capabilities_for(info: &BackendInfo) -> CapabilitySet {
         },
     );
 
-    set.set(Capability::AgentSession, {
-        let missing = crate::session::missing_requirements();
-        if missing.is_empty() {
+    set.set(
+        Capability::AgentSession,
+        if missing_session_helpers.is_empty() {
             CapabilityState::Supported
         } else {
             CapabilityState::unsupported(UnsupportedReason::ServiceUnavailable {
-                service: missing.join(", "),
+                service: missing_session_helpers.join(", "),
             })
-        }
-    });
+        },
+    );
 
     let input_state = match info.input {
         Backend::X11 => CapabilityState::Supported,
@@ -350,14 +368,14 @@ mod tests {
         // GrabFocus there returns success and does nothing; calling that
         // "degraded" invites an agent to rely on it and send every following
         // keystroke to the wrong window.
-        let caps = capabilities_for(&gnome_wayland());
+        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED);
         assert!(!caps.is_available(Capability::Focus));
     }
 
     #[test]
     fn focus_remains_supported_on_x11() {
         assert_eq!(
-            capabilities_for(&x11()).get(Capability::Focus),
+            capabilities_from(&x11(), &HELPERS_INSTALLED).get(Capability::Focus),
             CapabilityState::Supported
         );
     }
@@ -372,9 +390,15 @@ mod tests {
         )
     }
 
+    /// The helpers a session needs, as a machine that has them would report.
+    ///
+    /// Passed explicitly so these assertions describe the mapping rather than
+    /// the packages installed on whoever is running them.
+    const HELPERS_INSTALLED: [&str; 0] = [];
+
     #[test]
     fn x11_supports_everything_without_caveats() {
-        let caps = capabilities_for(&x11());
+        let caps = capabilities_from(&x11(), &HELPERS_INSTALLED);
         for capability in Capability::ALL {
             assert_eq!(
                 caps.get(capability),
@@ -388,7 +412,7 @@ mod tests {
     fn gnome_wayland_window_capture_is_degraded_rather_than_supported() {
         // The portal picker means a human chooses the window on first use.
         // Calling that "supported" would mislead an agent into a hang.
-        let caps = capabilities_for(&gnome_wayland());
+        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED);
         assert!(matches!(
             caps.get(Capability::WindowScreenshots),
             CapabilityState::Degraded { .. }
@@ -398,7 +422,7 @@ mod tests {
 
     #[test]
     fn gnome_wayland_window_listing_is_degraded_because_at_spi_cannot_see_everything() {
-        let caps = capabilities_for(&gnome_wayland());
+        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED);
         match caps.get(Capability::Windows) {
             CapabilityState::Degraded { note } => {
                 assert!(note.contains("stacking order"), "got {note}");
@@ -409,7 +433,7 @@ mod tests {
 
     #[test]
     fn kde_wayland_refuses_input_and_capture_but_keeps_accessibility() {
-        let caps = capabilities_for(&kde_wayland());
+        let caps = capabilities_from(&kde_wayland(), &HELPERS_INSTALLED);
         assert!(caps.is_available(Capability::Accessibility));
         assert!(caps.is_available(Capability::ElementActions));
         assert!(!caps.is_available(Capability::Mouse));
@@ -421,7 +445,7 @@ mod tests {
     fn a_missing_a11y_bus_is_reported_as_a_service_problem_not_a_missing_feature() {
         let mut broken = x11();
         broken.accessibility = Backend::None;
-        let caps = capabilities_for(&broken);
+        let caps = capabilities_from(&broken, &HELPERS_INSTALLED);
         assert_eq!(
             caps.get(Capability::Accessibility),
             CapabilityState::unsupported(UnsupportedReason::ServiceUnavailable {

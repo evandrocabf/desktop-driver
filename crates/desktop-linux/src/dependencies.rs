@@ -254,6 +254,12 @@ mod tests {
         }
     }
 
+    /// Note that this says nothing about `present`.
+    ///
+    /// Whether at-spi2-core happens to be installed is a property of the
+    /// machine running the test, not of the table: asserting it passed on a
+    /// developer's desktop and failed on a bare runner, where absent is the
+    /// correct answer. What belongs here is the classification.
     #[test]
     fn the_accessibility_bus_is_required_because_nothing_works_without_it() {
         let table = dependencies(&info(DisplayServer::Wayland));
@@ -262,7 +268,6 @@ mod tests {
             .find(|d| d.name == "at-spi2-core")
             .expect("at-spi2-core is always listed");
         assert_eq!(atspi.need, Need::Required);
-        assert!(atspi.present, "the probe said the bus was reachable");
     }
 
     #[test]
