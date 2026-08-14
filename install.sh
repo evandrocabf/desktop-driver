@@ -662,7 +662,14 @@ if [ "$UNINSTALL" -eq 1 ]; then
   step "Uninstalling desktop-driver"
 else
   step "Installing desktop-driver"
-  if ! is_checkout "$SRC"; then die "$SRC is not a desktop-driver checkout"; fi
+  # A dry run elides the clone, so on a machine with no checkout yet there is
+  # nothing here to recognise — which is the ordinary first-install case, and
+  # printing the plan is the whole point of asking for one.
+  if [ "$DRY_RUN" -eq 1 ] && [ "$SRC_MODE" = "clone" ] && [ ! -d "$SRC" ]; then
+    info "${DIM}the plan below assumes the clone above succeeded${R}"
+  elif ! is_checkout "$SRC"; then
+    die "$SRC is not a desktop-driver checkout"
+  fi
 fi
 info "source:  $SRC"
 if [ -n "$PROJECT_DIR" ]; then info "project: $PROJECT_DIR"; fi
