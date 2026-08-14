@@ -1,0 +1,19 @@
+[package]
+name = "desktop-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Platform-independent domain models, ports and normalization for desktop-driver."
+
+[lib]
+name = "desktop_core"
+path = "src/lib.rs"
+
+[dependencies]
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

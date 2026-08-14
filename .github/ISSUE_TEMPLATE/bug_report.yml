@@ -1,0 +1,75 @@
+name: Bug report
+description: Something behaves differently from what the docs promise
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        What this tool can do varies enormously by desktop, and it is meant to say so up front.
+        The output of `desktop doctor` and `desktop capabilities` usually identifies the problem
+        immediately, so both are asked for below.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: commands
+    attributes:
+      label: The commands you ran
+      description: >
+        Exactly, in order, including any global flags. If a snapshot is involved, the relevant
+        lines of it help more than a description of them.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `desktop doctor --json`
+      description: Redact anything you would rather not share — window titles can be revealing.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: capabilities
+    attributes:
+      label: Output of `desktop capabilities --json`
+      render: json
+    validations:
+      required: true
+
+  - type: input
+    id: application
+    attributes:
+      label: The application being driven
+      description: Name, version, and its toolkit if you know it (GTK 3/4, Qt, Electron, native).
+      placeholder: Firefox 150 / GTK 4
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Which display
+      options:
+        - The desktop I am sitting in front of
+        - An agent session (`desktop session`)
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: version
+    attributes:
+      label: Version
+      description: "Output of `desktop --version`, and `git rev-parse --short HEAD` if built from source."
+      render: shell
+    validations:
+      required: true

@@ -1,0 +1,25 @@
+[package]
+name = "desktop-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Linux platform adapters (AT-SPI, X11, xdg-desktop-portal) for desktop-driver."
+
+[lib]
+name = "desktop_linux"
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+desktop-core.workspace = true
+ashpd.workspace = true
+atspi.workspace = true
+image.workspace = true
+rustix.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+x11rb.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+serde_json.workspace = true

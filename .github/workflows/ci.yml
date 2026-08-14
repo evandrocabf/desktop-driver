@@ -1,0 +1,107 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Everything that does not need a desktop. Runs on any platform, so a
+  # regression in the shared core is caught before either backend is built.
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets
+      - name: architecture gates
+        run: cargo xtask architecture
+      # Comments are rustdoc, so the docs are part of the build rather than an
+      # afterthought — a broken link is a broken document.
+      - run: cargo doc --workspace --no-deps
+
+  # macOS is the platform that cannot be tested from a Linux workstation, so
+  # this job is the only thing standing between "compiles in theory" and
+  # "compiles". It builds the real binary and runs the platform-free tests.
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets
+      # Runs without any TCC grant, which is exactly the state a fresh machine
+      # is in: these three must explain themselves rather than fail.
+      - name: describe-only commands work unprivileged
+        run: |
+          ./target/debug/desktop info --json
+          ./target/debug/desktop capabilities --json
+          ./target/debug/desktop doctor --json
+      - name: sessions are refused honestly rather than half-implemented
+        run: |
+          set -e
+          ./target/debug/desktop session status | tee /tmp/status.txt
+          grep -q "cannot give the agent a display" /tmp/status.txt
+          if ./target/debug/desktop session start; then
+            echo "session start should have failed on macOS"; exit 1
+          fi
+
+  # The agent-session path end to end, in a container with no desktop at all.
+  session:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install the packages doctor names
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq at-spi2-core xvfb openbox dbus-bin zenity
+      - run: cargo build --release
+      - name: start a display, drive an application, capture it
+        run: |
+          set -e
+          D=./target/release/desktop
+          $D doctor
+          # Sessions are visible by default. A runner has no desktop to show one
+          # on, so this must fall back to headless and say why rather than fail.
+          $D session start --size 800x600 | tee /tmp/start.txt
+          grep -q "cannot watch it" /tmp/start.txt
+          $D session run zenity --info --text="ci probe"
+          sleep 5
+          $D apps | grep -q zenity
+          $D snapshot | grep -q "ci probe"
+          $D screenshot --output /tmp/shot.png
+          test -s /tmp/shot.png
+          $D session stop
+
+  # A single file that runs on any distribution regardless of its glibc.
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: it must really be static
+        run: |
+          file target/x86_64-unknown-linux-musl/release/desktop | grep -q static
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-x86_64-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/desktop

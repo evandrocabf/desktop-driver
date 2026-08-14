@@ -1,0 +1,27 @@
+[package]
+name = "desktop-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "macOS platform adapters (AXUIElement, CoreGraphics, ScreenCaptureKit) for desktop-driver."
+
+[lib]
+name = "desktop_macos"
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+desktop-core.workspace = true
+block2.workspace = true
+dispatch2.workspace = true
+objc2.workspace = true
+objc2-application-services.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-graphics.workspace = true
+objc2-foundation.workspace = true
+objc2-screen-capture-kit.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+serde_json.workspace = true

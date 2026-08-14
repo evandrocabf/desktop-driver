@@ -1,0 +1,56 @@
+name: Feature request
+description: Suggest a capability the tool is missing
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth knowing before you write: several things are *deliberately* refused rather than
+        missing. Focus under GNOME Wayland, naming a window to capture, and absolute coordinates for
+        GTK4 elements are all cases where the platform provides no mechanism, and guessing would
+        produce a confident wrong answer. `desktop capabilities` distinguishes "not implemented here"
+        from "no mechanism exists" — the first is a fair request, the second needs a new protocol
+        upstream.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: >
+        The task, not the API. What are you driving, and what is stopping you? A concrete example
+        is worth more than a general capability.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today instead
+      description: The workaround, if there is one, and where it breaks down.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Where this matters
+      multiple: true
+      options:
+        - Linux / X11
+        - GNOME Wayland
+        - KDE / wlroots / other Wayland
+        - Agent sessions
+        - macOS
+    validations:
+      required: true
+
+  - type: textarea
+    id: mechanism
+    attributes:
+      label: The mechanism, if you know one
+      description: >
+        A protocol, API or portal interface that would provide this, and whether your desktop
+        actually implements it. Not required — but it is usually the difference between a request
+        that can be acted on and one that cannot.
+    validations:
+      required: false

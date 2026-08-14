@@ -1,0 +1,67 @@
+[workspace]
+members = [
+    "crates/desktop-core",
+    "crates/desktop-linux",
+    "crates/desktop-macos",
+    "crates/desktop-cli",
+    "xtask",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+repository = "https://github.com/evandrocabf/desktop-driver"
+
+[workspace.dependencies]
+desktop-core = { path = "crates/desktop-core" }
+desktop-linux = { path = "crates/desktop-linux" }
+desktop-macos = { path = "crates/desktop-macos" }
+
+ashpd = { version = "=0.13.13", default-features = false, features = ["tokio"] }
+atspi = { version = "=0.30.0", default-features = false, features = ["connection", "p2p", "proxies", "tokio"] }
+clap = { version = "=4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+rustix = { version = "=1.1.4", default-features = false, features = ["process", "std", "use-libc-auxv"] }
+schemars = { version = "=1.2.2", default-features = false, features = ["derive", "std"] }
+serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
+thiserror = { version = "=2.0.20", default-features = false, features = ["std"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "sync", "time"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["attributes", "std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "registry", "std"] }
+x11rb = { version = "=0.14.0", default-features = false, features = ["randr", "xtest"] }
+
+block2 = { version = "=0.6.2", default-features = false, features = ["std"] }
+dispatch2 = { version = "=0.3.1", default-features = false, features = ["std"] }
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
+objc2-application-services = { version = "=0.3.2", default-features = false, features = ["AXError", "AXUIElement", "AXValue", "AXValueConstants", "HIServices", "libc", "std"] }
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["CFArray", "CFBase", "CFDictionary", "CFNumber", "CFString", "std"] }
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGDirectDisplay", "CGError", "CGEvent", "CGEventSource", "CGDataProvider", "CGEventTypes", "CGGeometry", "CGImage", "CGRemoteOperation", "CGWindow", "libc", "objc2", "std"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std"] }
+objc2-screen-capture-kit = { version = "=0.3.2", default-features = false, features = ["SCScreenshotManager", "SCShareableContent", "SCStream", "block2", "libc", "objc2-core-foundation", "objc2-core-graphics", "std"] }
+
+[profile.dev]
+opt-level = 1
+debug = 2
+overflow-checks = true
+
+[profile.test]
+opt-level = 1
+debug = 2
+overflow-checks = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+overflow-checks = true
+debug = "line-tables-only"
+incremental = false
+strip = "none"
+
+[profile.bench]
+inherits = "release"
