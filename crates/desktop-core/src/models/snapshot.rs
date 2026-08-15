@@ -47,6 +47,15 @@ pub struct Snapshot {
     /// Nodes the platform reported, before pruning. The ratio against
     /// `elements.len()` is the token saving.
     pub visited_nodes: usize,
+    /// The display this was taken on, so it is never read against another.
+    ///
+    /// Element ids mean nothing outside the tree they were numbered in. The
+    /// store is one file per user, shared by the user's own desktop and by
+    /// every agent session, so without this a snapshot survives
+    /// `session start` and `session stop` and gets searched against a display
+    /// it never described. `None` where the platform has only one display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 impl Snapshot {
@@ -153,6 +162,7 @@ mod tests {
             elements,
             truncated: false,
             visited_nodes: 0,
+            display: None,
         }
     }
 

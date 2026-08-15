@@ -18,6 +18,27 @@ use crate::{
     models::{ids::ElementId, path::ElementPath, snapshot::Snapshot},
 };
 
+/// Which display commands currently address, as a snapshot records it.
+///
+/// `DISPLAY` because that is precisely what a session changes: `desktop
+/// session start` puts `:90` in the environment of everything that follows,
+/// and leaving the session puts the user's own back.
+///
+/// This does **not** distinguish one agent session from the next. A new
+/// session takes the lowest free display number, which is normally the one the
+/// last session just released, so both are `:90` and both stamps match. That
+/// gap is closed at the other end, by `desktop session` discarding the stored
+/// snapshot when it starts or stops one.
+///
+/// `None` on a platform that has no such variable, where there is one display
+/// and nothing to confuse it with.
+#[must_use]
+pub fn current_display() -> Option<String> {
+    std::env::var("DISPLAY")
+        .ok()
+        .filter(|display| !display.is_empty())
+}
+
 /// Where the last snapshot is kept.
 #[derive(Clone, Debug)]
 pub struct SessionStore {
@@ -52,10 +73,29 @@ impl SessionStore {
         &self.path
     }
 
+    /// Stamps the snapshot with the display it was taken on, then writes it.
+    ///
+    /// Stamped here rather than by the caller so no path can forget: a
+    /// snapshot with no display would be readable from anywhere, which is the
+    /// behaviour this exists to end.
     pub fn save(&self, snapshot: &Snapshot) -> Result<()> {
+        self.save_on(snapshot, current_display().as_deref())
+    }
+
+    /// The same, told which display to stamp.
+    ///
+    /// Split out so the stamping can be tested without setting `DISPLAY` in
+    /// the process, which this crate could not do anyway: `set_var` is
+    /// `unsafe` in edition 2024 and racy across parallel tests, and
+    /// `desktop-core` forbids `unsafe` outright.
+    pub fn save_on(&self, snapshot: &Snapshot, display: Option<&str>) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             crate::agent::create_private_dir(parent)?;
         }
+
+        let mut snapshot = snapshot.clone();
+        snapshot.display = display.map(ToOwned::to_owned);
+        let snapshot = &snapshot;
 
         let encoded = serde_json::to_vec(snapshot)
             .map_err(|error| DesktopError::internal(format!("cannot encode snapshot: {error}")))?;
@@ -82,14 +122,46 @@ impl SessionStore {
         })
     }
 
+    /// The last snapshot, if it describes the display in hand.
+    ///
+    /// A snapshot taken on another display is refused rather than searched.
+    /// Element ids are positions in one numbered tree; read against a
+    /// different one they resolve to whatever happens to sit at that index, so
+    /// `find` would answer with a widget that is not on the screen the caller
+    /// is addressing, and answer it with a success.
+    ///
+    /// One taken before this field existed carries no display and is trusted,
+    /// since the only alternative is refusing every snapshot written by an
+    /// older build.
     pub fn load(&self) -> Result<Snapshot> {
+        self.load_on(current_display().as_deref())
+    }
+
+    /// The same, told which display is current.
+    pub fn load_on(&self, now: Option<&str>) -> Result<Snapshot> {
         let bytes = fs::read(&self.path).map_err(|_| DesktopError::NoSnapshot)?;
-        serde_json::from_slice(&bytes).map_err(|_| DesktopError::NoSnapshot)
+        let snapshot: Snapshot =
+            serde_json::from_slice(&bytes).map_err(|_| DesktopError::NoSnapshot)?;
+
+        if let Some(taken_on) = snapshot.display.as_deref()
+            && now != Some(taken_on)
+        {
+            return Err(DesktopError::SnapshotFromAnotherDisplay {
+                taken_on: taken_on.to_owned(),
+                now: now.unwrap_or("no display").to_owned(),
+            });
+        }
+        Ok(snapshot)
     }
 
     /// The path recorded for an element id in the last snapshot.
     pub fn lookup(&self, id: ElementId) -> Result<ElementPath> {
-        let snapshot = self.load()?;
+        self.lookup_on(id, current_display().as_deref())
+    }
+
+    /// The same, told which display is current.
+    pub fn lookup_on(&self, id: ElementId, now: Option<&str>) -> Result<ElementPath> {
+        let snapshot = self.load_on(now)?;
         let element = snapshot
             .find(id)
             .ok_or_else(|| DesktopError::ElementNotFound {
@@ -123,6 +195,91 @@ mod tests {
         path::PathStep,
         role::Role,
     };
+
+    #[test]
+    fn a_snapshot_from_another_display_is_refused_rather_than_searched() {
+        let store = temp_store("other-display");
+        store
+            .save_on(&snapshot_with_element(), Some(":90"))
+            .expect("saves");
+
+        let error = store
+            .load_on(Some(":0"))
+            .expect_err("a snapshot of :90 must not be read against :0");
+
+        match error {
+            DesktopError::SnapshotFromAnotherDisplay { taken_on, now } => {
+                assert_eq!(taken_on, ":90");
+                assert_eq!(now, ":0");
+            }
+            other => panic!("expected a display mismatch, got {other:?}"),
+        }
+        let _ = store.clear();
+    }
+
+    /// The same refusal in the other direction, which is the commoner one.
+    ///
+    /// An agent snapshots inside its session, the session ends, and the next
+    /// command addresses the user's desktop with the ids still on file.
+    #[test]
+    fn leaving_a_session_invalidates_what_was_snapshotted_inside_it() {
+        let store = temp_store("left-session");
+        store
+            .save_on(&snapshot_with_element(), Some(":90"))
+            .expect("saves");
+
+        assert!(matches!(
+            store.load_on(None),
+            Err(DesktopError::SnapshotFromAnotherDisplay { .. })
+        ));
+        let _ = store.clear();
+    }
+
+    #[test]
+    fn the_same_display_still_reads_back() {
+        let store = temp_store("same-display");
+        store
+            .save_on(&snapshot_with_element(), Some(":90"))
+            .expect("saves");
+
+        let loaded = store.load_on(Some(":90")).expect("the display matches");
+        assert_eq!(loaded.elements.len(), 1);
+        let _ = store.clear();
+    }
+
+    /// Snapshots written before the field existed carry no display.
+    ///
+    /// Refusing those would break every caller mid-upgrade, for a risk that
+    /// only exists once sessions are in play.
+    #[test]
+    fn a_snapshot_without_a_display_is_still_readable() {
+        let store = temp_store("no-display");
+        store
+            .save_on(&snapshot_with_element(), None)
+            .expect("saves");
+
+        let loaded = store.load_on(Some(":0")).expect("stays readable");
+        assert_eq!(loaded.elements.len(), 1);
+        let _ = store.clear();
+    }
+
+    /// The id lookup behind `--element N` goes through the same gate.
+    ///
+    /// It is the one that matters most: `find` reporting a phantom is
+    /// misleading, but acting on one is what would touch the wrong window.
+    #[test]
+    fn resolving_an_element_id_is_refused_across_displays_too() {
+        let store = temp_store("lookup-across");
+        store
+            .save_on(&snapshot_with_element(), Some(":90"))
+            .expect("saves");
+
+        assert!(matches!(
+            store.lookup_on(ElementId::new(42), Some(":0")),
+            Err(DesktopError::SnapshotFromAnotherDisplay { .. })
+        ));
+        let _ = store.clear();
+    }
 
     fn temp_store(tag: &str) -> SessionStore {
         let mut path = std::env::temp_dir();
@@ -159,6 +316,7 @@ mod tests {
             }],
             truncated: false,
             visited_nodes: 3,
+            display: None,
         }
     }
 

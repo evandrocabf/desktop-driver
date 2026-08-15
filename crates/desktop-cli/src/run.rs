@@ -7,7 +7,7 @@
 use std::io::Write;
 
 use desktop_core::{
-    Driver,
+    Driver, SessionStore,
     agent::{SessionHost, Visibility},
     errors::{DesktopError, ExitCategory, Result},
     models::{
@@ -74,7 +74,7 @@ fn dispatch(
     sink: &mut Sink<'_>,
 ) -> Result<()> {
     match &cli.command {
-        Command::Session(command) => session(command, sessions, sink),
+        Command::Session(command) => session(command, sessions, driver.store(), sink),
         Command::Info => output::render_info(sink, &driver.info()),
         Command::Capabilities => {
             output::render_capabilities(sink, &driver.info(), &driver.capabilities())
@@ -189,9 +189,18 @@ fn dispatch(
 ///
 /// A session nobody can watch is the exception rather than the norm, so it has
 /// to explain itself rather than quietly being one.
+///
+/// Starting and stopping both discard the stored snapshot. The display stamp
+/// on a snapshot catches a tree from the user's desktop being read inside a
+/// session and the reverse, but not one session's tree read in the next: a new
+/// session takes the first free display number, which is usually the one the
+/// last session just released. Element ids from a display that has been torn
+/// down and rebuilt describe nothing, and there is nothing to salvage by
+/// keeping them.
 fn session(
     command: &SessionCommand,
     sessions: &dyn SessionHost,
+    store: &SessionStore,
     sink: &mut Sink<'_>,
 ) -> Result<()> {
     match command {
@@ -211,6 +220,7 @@ fn session(
                 },
                 share_home: args.share_home,
             })?;
+            store.clear()?;
             let unwatchable = if started.visible {
                 None
             } else {
@@ -223,6 +233,7 @@ fn session(
         }
         SessionCommand::Stop => {
             let stopped = sessions.stop()?;
+            store.clear()?;
             output::render_session_stopped(sink, stopped.as_ref())
         }
         SessionCommand::Run(args) => {

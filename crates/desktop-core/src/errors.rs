@@ -123,6 +123,18 @@ pub enum DesktopError {
     #[error("no snapshot has been taken in this session")]
     NoSnapshot,
 
+    /// The stored snapshot describes a different display than the one in hand.
+    ///
+    /// Names both, because the fix depends on which way round it is: a
+    /// snapshot of the user's desktop read inside an agent session, or the
+    /// reverse after `session stop`. Refusing beats clearing silently — the
+    /// caller asked about a tree that exists, just not here.
+    #[error(
+        "the last snapshot was taken on {taken_on}, but commands now address {now}. \
+         Take a new one with `desktop snapshot`."
+    )]
+    SnapshotFromAnotherDisplay { taken_on: String, now: String },
+
     #[error("element {element} no longer matches the tree it was recorded from")]
     ElementStale {
         element: ElementId,
@@ -181,6 +193,7 @@ impl DesktopError {
             Self::PolicyDenied { .. } => ExitCategory::PolicyDenied,
             Self::Timeout { .. } => ExitCategory::Timeout,
             Self::NoSnapshot
+            | Self::SnapshotFromAnotherDisplay { .. }
             | Self::ElementStale { .. }
             | Self::ElementNotFound { .. }
             | Self::AmbiguousSelector { .. }

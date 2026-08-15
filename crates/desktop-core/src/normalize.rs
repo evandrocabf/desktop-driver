@@ -71,6 +71,11 @@ impl SnapshotContext {
 /// `click --x --y` at the corner of the screen for every element on the page.
 /// `null` says the position is unknown, which is the truth and which a caller
 /// can branch on.
+///
+/// [`Snapshot::display`] is left unset here. Which display a tree came from
+/// only matters once it is written down for another process to read back, so
+/// it is stamped by [`crate::SessionStore::save`] — the one place that knows
+/// that is happening.
 pub fn snapshot(root: &RawNode, context: &SnapshotContext) -> Snapshot {
     let mut walker = Walker {
         context,
@@ -95,6 +100,7 @@ pub fn snapshot(root: &RawNode, context: &SnapshotContext) -> Snapshot {
         elements,
         truncated: walker.truncated,
         visited_nodes: walker.visited,
+        display: None,
     }
 }
 
