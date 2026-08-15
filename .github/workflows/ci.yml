@@ -88,8 +88,19 @@ jobs:
           $D session start --size 800x600 | tee /tmp/start.txt
           grep -q "cannot watch it" /tmp/start.txt
           $D session run zenity --info --text="ci probe"
-          sleep 5
+          # Polled rather than slept: how long a GTK application takes to
+          # reach the accessibility bus varies by an order of magnitude with
+          # how loaded the machine is, and a fixed wait turns that into a
+          # flake that looks like a broken tool.
+          for _ in $(seq 1 30); do
+            if $D apps | grep -q zenity; then break; fi
+            sleep 2
+          done
           $D apps | grep -q zenity
+          for _ in $(seq 1 15); do
+            if $D snapshot | grep -q "ci probe"; then break; fi
+            sleep 2
+          done
           $D snapshot | grep -q "ci probe"
           $D screenshot --output /tmp/shot.png
           test -s /tmp/shot.png
