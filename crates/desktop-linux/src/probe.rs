@@ -103,9 +103,13 @@ impl PlatformProbe for LinuxProbe {
 /// **Focus** is supported under X11 via `_NET_ACTIVE_WINDOW`, whose result is
 /// read back from the root window afterwards, so a window manager that refuses
 /// is reported as a failure rather than as success. Under Wayland it is
-/// unsupported outright: verified on GNOME 49, AT-SPI `GrabFocus` returns
-/// success and changes nothing, and there is no client-initiated raise, so this
-/// is a no-op rather than a best effort.
+/// degraded: there is no client-initiated raise, and AT-SPI `GrabFocus` returns
+/// success while changing nothing — verified on GNOME 49 — so what is attempted
+/// instead is asking the application to present itself over D-Bus, which
+/// reaches only applications exporting `org.freedesktop.Application` and which
+/// the compositor may answer by highlighting the window rather than raising it.
+/// The result is checked either way, so the failure is reported rather than
+/// assumed away.
 ///
 /// **Screenshots and input** stop warning about the approval dialog once the
 /// desktop has recorded the grant, since saying so then would be stale advice.
@@ -249,6 +253,14 @@ pub fn capabilities_from(
         Capability::Focus,
         match info.display_server {
             DisplayServer::X11 => CapabilityState::Supported,
+            DisplayServer::Wayland => CapabilityState::degraded(
+                "no protocol lets a client raise a window, so focus is attempted by asking \
+                 the application to present itself over D-Bus and then checking whether it \
+                 did: an application exporting no org.freedesktop.Application cannot be asked \
+                 at all, and a compositor may answer by marking the window as demanding \
+                 attention instead. Either way `desktop focus` fails rather than reporting a \
+                 change that did not happen",
+            ),
             _ => CapabilityState::unsupported(UnsupportedReason::NoBackendMechanism),
         },
     );
@@ -453,13 +465,23 @@ mod tests {
         )
     }
 
-    /// `GrabFocus` there returns success and does nothing; calling that
-    /// "degraded" invites an agent to rely on it and send every following
-    /// keystroke to the wrong window.
+    /// This was unavailable outright, on the grounds that `GrabFocus` returns
+    /// success and does nothing — calling *that* degraded would have invited an
+    /// agent to rely on it and send every following keystroke to the wrong
+    /// window. Asking the application to present itself is a different claim:
+    /// it sometimes works, and the driver looks afterwards either way, so the
+    /// failure mode is a reported failure rather than a silent one.
     #[test]
-    fn focus_is_reported_unavailable_on_wayland_rather_than_merely_degraded() {
+    fn focus_under_wayland_is_attempted_and_verified_rather_than_refused_outright() {
         let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED, granted());
-        assert!(!caps.is_available(Capability::Focus));
+        match caps.get(Capability::Focus) {
+            CapabilityState::Degraded { note } => {
+                assert!(note.contains("org.freedesktop.Application"), "got {note}");
+                assert!(note.contains("fails"), "got {note}");
+            }
+            other => panic!("expected degraded, got {other:?}"),
+        }
+        assert!(caps.is_available(Capability::Focus));
     }
 
     #[test]
@@ -468,6 +490,16 @@ mod tests {
             capabilities_from(&x11(), &HELPERS_INSTALLED, granted()).get(Capability::Focus),
             CapabilityState::Supported
         );
+    }
+
+    /// A session with no display server has no window to raise, so there is
+    /// nothing to attempt and nothing to verify.
+    #[test]
+    fn focus_is_unavailable_where_there_is_no_display_at_all() {
+        let mut headless = gnome_wayland();
+        headless.display_server = DisplayServer::Headless;
+        let caps = capabilities_from(&headless, &HELPERS_INSTALLED, granted());
+        assert!(!caps.is_available(Capability::Focus));
     }
 
     /// The whole point of the grant: once it is recorded there is no dialog

@@ -17,6 +17,7 @@
 #![cfg(target_os = "linux")]
 
 mod a11y;
+mod activate;
 pub mod dependencies;
 mod detect;
 pub mod portal;

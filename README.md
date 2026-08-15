@@ -81,9 +81,12 @@ Three honest limits:
   the accessibility text API and then ignores the write. Rather than report a
   write that never happened, `set_text` reads the field back and fails with the
   reason. GTK text views, and most native controls, work.
-- **Focus cannot be taken at all under Wayland.** There is no client-initiated
-  window raise, so `desktop focus` refuses rather than reporting a change that
-  did not happen. Keystrokes therefore go wherever *you* last clicked.
+- **Focus under Wayland is a request, not a command.** There is no
+  client-initiated raise, so the only lever is asking the application to present
+  itself; applications that do not speak D-Bus cannot be asked, and the
+  compositor may decline. `desktop focus` verifies and refuses rather than
+  reporting a change that did not happen, so keystrokes go wherever *you* last
+  clicked until one succeeds.
 - **Screenshots are still whole-screen.** Capture sees your windows too, which
   matters if the images go to a model. Per-window capture is the thing GNOME
   Wayland does not offer.
@@ -207,7 +210,7 @@ available.
 | screenshot (screen) | ✓ | ✓ | ~ | ~ | ✓ |
 | screenshot (window) | ✓ | ✓ | ✗ | ✗ | ✓ |
 | mouse / keyboard / scroll | ✓ | ✓ | ~ | ~ | ✓ |
-| focus | ✓ | ✓ | ✗ | ✗ | ✓ |
+| focus | ✓ | ✓ | ~ | ~ | ✓ |
 | agent session | ✗ | ✓ | ✓ | ✓ | — |
 
 The accessibility tree is the one row that is green everywhere, because AT-SPI
@@ -249,12 +252,22 @@ one window server per login and no supported way to make another.
   with no accessibility support at all. Those last ones are marked
   `"accessible": false`: they can be screenshotted and clicked by coordinate, but
   `desktop snapshot` on one refuses rather than inventing an empty tree.
-- **Focus under Wayland** is not merely unreliable, it is absent: there is no
-  protocol for a client to raise a window. AT-SPI's `GrabFocus` returns success
-  and does nothing, so the driver verifies the window actually became active and
-  refuses when it did not. Under X11 focus goes through `_NET_ACTIVE_WINDOW`
-  and the result is read back from the root window, so a window manager that
-  declines is reported as a failure rather than as success.
+- **Focus under Wayland** has no protocol behind it: nothing lets a client raise
+  a window, and AT-SPI's `GrabFocus` returns success while doing nothing. What
+  is left is asking the *application* to present itself, over
+  `org.freedesktop.Application.Activate` — a request the compositor weighs quite
+  differently from a stranger demanding focus. It reaches only applications that
+  export that interface, and mutter may still answer by marking the window as
+  demanding attention rather than raising it, so the driver checks whether the
+  window actually became active and fails when it did not. Under X11 focus goes
+  through `_NET_ACTIVE_WINDOW` and the result is read back from the root window,
+  so a window manager that declines is reported as a failure rather than as
+  success.
+- **GNOME's own window APIs are closed to us**, which is why none of this goes
+  through them. `org.gnome.Shell.Introspect` — the window list, with titles and
+  app ids — and `org.gnome.Shell.Screenshot` both check the caller against an
+  allowlist containing the two portal implementations and nothing else. The
+  portal is the whole of the sanctioned surface on GNOME.
 - **KDE and wlroots** also have native mechanisms upstream —
   `org.kde.KWin.ScreenShot2`, `wlr-screencopy`, `zwlr_virtual_pointer_v1` — that
   this build does not implement. They would buy what the portals cannot give:

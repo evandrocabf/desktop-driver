@@ -911,15 +911,25 @@ impl AccessibilityPort for AtSpi {
 
     /// Raises a window and gives it the keyboard.
     ///
-    /// The window manager is tried first where there is one: `_NET_ACTIVE_WINDOW`
-    /// both raises and focuses, and — unlike `GrabFocus` — its result is
-    /// observable, so success is verified rather than assumed.
+    /// Three routes, each verified rather than trusted, in descending order of
+    /// how much authority the thing being asked actually has.
     ///
-    /// `GrabFocus` is the fallback, and it returns success whether or not
-    /// anything happened. Under Wayland there is no client-initiated raise at
-    /// all, so on GNOME it is reliably a no-op; reporting a focus change that
-    /// did not occur would send every later keystroke to the wrong window,
-    /// which is why the window is checked for the active state afterwards.
+    /// The window manager first, where there is one: `_NET_ACTIVE_WINDOW` both
+    /// raises and focuses, and its result is observable on the root window.
+    ///
+    /// Then the application itself, which is all Wayland leaves —
+    /// `org.freedesktop.Application.Activate`, asking the program to present
+    /// its own window. It reaches only applications exporting that interface,
+    /// and the compositor may answer a present by marking the window as
+    /// demanding attention instead, so what it returns is "the application was
+    /// asked", not "the window is now focused". The difference is settled by
+    /// looking.
+    ///
+    /// `GrabFocus` last, which returns success whether or not anything
+    /// happened. Reporting a focus change that did not occur would send every
+    /// later keystroke to a window the caller never looked at, so the window is
+    /// checked for the active state afterwards and a refusal is reported as
+    /// one.
     fn focus(&self, target: &Target) -> Result<()> {
         let row = runtime::try_block_on(self.locate(target))??;
         let (app, window) = row.frame.clone().expect("locate returns rows with a tree");
@@ -929,6 +939,13 @@ impl AccessibilityPort for AtSpi {
         {
             self.settle(&window.object);
             return Ok(());
+        }
+
+        if crate::activate::present_application(app.pid.get()).unwrap_or(false) {
+            self.settle(&window.object);
+            if runtime::block_on(self.is_active(&window.object)) {
+                return Ok(());
+            }
         }
 
         runtime::try_block_on(async {
