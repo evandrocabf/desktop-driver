@@ -169,10 +169,17 @@ pub fn screenshot_permission_granted() -> bool {
     })
 }
 
-/// Whether any grant has been recorded in the default location.
+/// Whether the RemoteDesktop grant that mouse, keyboard and scroll ride on has
+/// been given.
+///
+/// One token rather than any token: a window-capture grant is a grant for
+/// something else entirely, and answering "input needs no approval" on the
+/// strength of it would send an agent into a dialog it was told was not coming.
 #[must_use]
-pub fn has_stored_token() -> bool {
-    TokenStore::at_default_path().has_any()
+pub fn has_input_token() -> bool {
+    TokenStore::at_default_path()
+        .load(TokenKind::ScreenInput)
+        .is_some()
 }
 
 /// A restore token is a capability to control the desktop; other users on the

@@ -71,3 +71,6 @@ the binary and links the agent skill into whichever coding agents are present.
 - Input under Wayland needs both the RemoteDesktop and ScreenCast portals, because absolute pointer
   positioning interprets its coordinates in a screencast stream's space. A session offering only one
   of the two reports no input backend instead of failing on its first click.
+- Portal-backed capabilities stop warning about the approval dialog once the grant has been
+  recorded. Screen capture already did; mouse, keyboard and scroll repeated the warning forever,
+  including on a machine where `desktop setup` had long since answered it.

@@ -42,7 +42,7 @@ impl PlatformProbe for LinuxProbe {
         if self.info.input == Backend::RemoteDesktopPortal {
             out.push(PermissionState {
                 permission: Permission::RemoteDesktopPortal,
-                granted: crate::portal::has_stored_token(),
+                granted: crate::portal::has_input_token(),
                 remedy: Some(
                     "run `desktop setup` once and approve the dialog; the grant is then \
                      remembered via a portal restore token"
@@ -107,9 +107,10 @@ impl PlatformProbe for LinuxProbe {
 /// success and changes nothing, and there is no client-initiated raise, so this
 /// is a no-op rather than a best effort.
 ///
-/// **Screenshots** stop warning about the approval dialog once the desktop has
-/// recorded the grant, since saying so then would be stale advice. Away from
-/// GNOME they carry the caveat that the portal backend is untested here.
+/// **Screenshots and input** stop warning about the approval dialog once the
+/// desktop has recorded the grant, since saying so then would be stale advice.
+/// Away from GNOME they carry the caveat that the portal backend is untested
+/// here, which no grant changes.
 ///
 /// **Window screenshots** are unavailable under Wayland. The Screenshot portal
 /// has no window target that any backend implements, and the ScreenCast route
@@ -118,28 +119,19 @@ impl PlatformProbe for LinuxProbe {
 /// outright — a caveat describing a route the code never took.
 #[must_use]
 pub fn capabilities_for(info: &BackendInfo) -> CapabilitySet {
-    capabilities_from(info, &crate::session::missing_requirements())
+    capabilities_from(
+        info,
+        &crate::session::missing_requirements(),
+        Grants::on_this_host(),
+    )
 }
 
-/// The same mapping, with the one input that does not come from `info`.
-///
-/// Every capability above is a function of which backends were selected.
-/// Agent sessions are the exception: they need `Xvfb`, a window manager and a
-/// D-Bus daemon *installed on the host*, which no `BackendInfo` describes. That
-/// was read from the filesystem inside the mapping, which made the whole
-/// function depend on the machine it ran on — so the table-driven tests below
-/// passed on a developer's desktop and failed on a bare runner with none of
-/// those packages, which is the honest answer for that machine and the wrong
-/// question for a unit test.
-///
-/// Taking it as an argument keeps the mapping pure and leaves
-/// [`capabilities_for`] as the one place that looks at the host.
 /// The caveat a portal-backed capability carries away from GNOME.
 ///
 /// The interfaces are freedesktop's and every backend implements the same ones,
-/// which is why they are now selected wherever they are advertised rather than
-/// on GNOME alone. What is *not* the same everywhere is how each backend
-/// behaves in practice, and only GNOME's has been run against. Saying so is the
+/// which is why they are selected wherever they are advertised rather than on
+/// GNOME alone. What is *not* the same everywhere is how each backend behaves
+/// in practice, and only GNOME's has been run against. Saying so is the
 /// difference between an untested path and an unclaimed one.
 fn unverified_portal_backend(info: &BackendInfo) -> Option<String> {
     match info.desktop_environment {
@@ -152,8 +144,68 @@ fn unverified_portal_backend(info: &BackendInfo) -> Option<String> {
     }
 }
 
+/// The one-time approvals this session has already been given.
+///
+/// A grant is the difference between "this works" and "this works, after a
+/// dialog someone has to answer" — which is the difference between an agent
+/// proceeding and an agent hanging in front of a prompt nobody is watching.
+/// Both are read from the host, so they arrive as data for the same reason the
+/// session helpers do.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Grants {
+    pub screenshot: bool,
+    pub input: bool,
+}
+
+impl Grants {
+    /// What this machine has actually been granted.
+    #[must_use]
+    pub fn on_this_host() -> Self {
+        Self {
+            screenshot: crate::portal::screenshot_permission_granted(),
+            input: crate::portal::has_input_token(),
+        }
+    }
+}
+
+/// A portal-backed capability, given whether its grant has been made.
+///
+/// Once the desktop has recorded the approval there is no dialog left to warn
+/// about, and saying otherwise is stale advice that reads as "this will
+/// interrupt you" every time. What survives the grant is the caveat about which
+/// portal backend this has been run against, because that does not change by
+/// being approved.
+fn portal_state(approval: &str, granted: bool, info: &BackendInfo) -> CapabilityState {
+    match (granted, unverified_portal_backend(info)) {
+        (true, None) => CapabilityState::Supported,
+        (true, Some(caveat)) => CapabilityState::degraded(&caveat),
+        (false, None) => CapabilityState::degraded(approval),
+        (false, Some(caveat)) => CapabilityState::degraded(&format!("{approval}. {caveat}")),
+    }
+}
+
+/// The same mapping, with the two inputs that do not come from `info`.
+///
+/// Every capability above is a function of which backends were selected. Agent
+/// sessions and portal grants are the exceptions: the first needs `Xvfb`, a
+/// window manager and a D-Bus daemon *installed on the host*, and the second is
+/// a permission recorded by the desktop. Neither is described by any
+/// `BackendInfo`.
+///
+/// Both were read from the host inside the mapping, which made the whole
+/// function depend on the machine it ran on — so the table-driven tests below
+/// passed on a developer's desktop and failed on a bare runner with none of
+/// those packages, which is the honest answer for that machine and the wrong
+/// question for a unit test.
+///
+/// Taking them as arguments keeps the mapping pure and leaves
+/// [`capabilities_for`] as the one place that looks at the host.
 #[must_use]
-pub fn capabilities_from(info: &BackendInfo, missing_session_helpers: &[&str]) -> CapabilitySet {
+pub fn capabilities_from(
+    info: &BackendInfo,
+    missing_session_helpers: &[&str],
+    grants: Grants,
+) -> CapabilitySet {
     let mut set = CapabilitySet::new();
 
     let a11y_present = info.accessibility != Backend::None;
@@ -205,23 +257,12 @@ pub fn capabilities_from(info: &BackendInfo, missing_session_helpers: &[&str]) -
         Capability::Screenshots,
         match info.screenshot {
             Backend::X11 => CapabilityState::Supported,
-            Backend::XdgDesktopPortal => {
-                let mut note = String::new();
-                if !crate::portal::screenshot_permission_granted() {
-                    note.push_str(
-                        "the first capture needs a one-time approval dialog; \
-                         run `desktop setup` to get it over with",
-                    );
-                }
-                match (note.is_empty(), unverified_portal_backend(info)) {
-                    (true, None) => CapabilityState::Supported,
-                    (true, Some(caveat)) => CapabilityState::degraded(&caveat),
-                    (false, None) => CapabilityState::degraded(&note),
-                    (false, Some(caveat)) => {
-                        CapabilityState::degraded(&format!("{note}. {caveat}"))
-                    }
-                }
-            }
+            Backend::XdgDesktopPortal => portal_state(
+                "the first capture needs a one-time approval dialog; run `desktop setup` \
+                 to get it over with",
+                grants.screenshot,
+                info,
+            ),
             _ => CapabilityState::unsupported(UnsupportedReason::NoBackendMechanism),
         },
     );
@@ -247,13 +288,12 @@ pub fn capabilities_from(info: &BackendInfo, missing_session_helpers: &[&str]) -
 
     let input_state = match info.input {
         Backend::X11 => CapabilityState::Supported,
-        Backend::RemoteDesktopPortal => {
-            let base = "input goes through the RemoteDesktop portal; the first use needs approval";
-            match unverified_portal_backend(info) {
-                None => CapabilityState::degraded(base),
-                Some(caveat) => CapabilityState::degraded(&format!("{base}. {caveat}")),
-            }
-        }
+        Backend::RemoteDesktopPortal => portal_state(
+            "input goes through the RemoteDesktop portal, whose first use needs approval; \
+             run `desktop setup` to get it over with",
+            grants.input,
+            info,
+        ),
         _ => CapabilityState::unsupported(UnsupportedReason::NoBackendMechanism),
     };
     for capability in [Capability::Mouse, Capability::Keyboard, Capability::Scroll] {
@@ -413,21 +453,69 @@ mod tests {
         )
     }
 
+    /// `GrabFocus` there returns success and does nothing; calling that
+    /// "degraded" invites an agent to rely on it and send every following
+    /// keystroke to the wrong window.
     #[test]
     fn focus_is_reported_unavailable_on_wayland_rather_than_merely_degraded() {
-        // GrabFocus there returns success and does nothing; calling that
-        // "degraded" invites an agent to rely on it and send every following
-        // keystroke to the wrong window.
-        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED);
+        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED, granted());
         assert!(!caps.is_available(Capability::Focus));
     }
 
     #[test]
     fn focus_remains_supported_on_x11() {
         assert_eq!(
-            capabilities_from(&x11(), &HELPERS_INSTALLED).get(Capability::Focus),
+            capabilities_from(&x11(), &HELPERS_INSTALLED, granted()).get(Capability::Focus),
             CapabilityState::Supported
         );
+    }
+
+    /// The whole point of the grant: once it is recorded there is no dialog
+    /// left to warn about, and repeating the warning is stale advice that reads
+    /// as "this will interrupt you" on every run.
+    #[test]
+    fn a_granted_portal_capability_stops_warning_about_the_dialog() {
+        let ungranted = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED, Grants::default());
+        for capability in [Capability::Mouse, Capability::Screenshots] {
+            match ungranted.get(capability) {
+                CapabilityState::Degraded { note } => {
+                    assert!(note.contains("approval"), "{capability:?} note was {note}");
+                }
+                other => panic!("expected {capability:?} degraded, got {other:?}"),
+            }
+        }
+
+        let granted = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED, granted());
+        for capability in [Capability::Mouse, Capability::Screenshots] {
+            assert_eq!(
+                granted.get(capability),
+                CapabilityState::Supported,
+                "{capability:?} should be plain once granted"
+            );
+        }
+    }
+
+    /// One grant is not the other. Input rides on the RemoteDesktop token and
+    /// screen capture on the permission store, and a machine that has answered
+    /// one dialog has not answered the other.
+    #[test]
+    fn the_two_grants_are_reported_independently() {
+        let caps = capabilities_from(
+            &gnome_wayland(),
+            &HELPERS_INSTALLED,
+            Grants {
+                screenshot: true,
+                input: false,
+            },
+        );
+        assert_eq!(
+            caps.get(Capability::Screenshots),
+            CapabilityState::Supported
+        );
+        assert!(matches!(
+            caps.get(Capability::Mouse),
+            CapabilityState::Degraded { .. }
+        ));
     }
 
     fn kde_wayland() -> BackendInfo {
@@ -446,9 +534,17 @@ mod tests {
     /// the packages installed on whoever is running them.
     const HELPERS_INSTALLED: [&str; 0] = [];
 
+    /// The state after `desktop setup`, which most of the table is about.
+    const fn granted() -> Grants {
+        Grants {
+            screenshot: true,
+            input: true,
+        }
+    }
+
     #[test]
     fn x11_supports_everything_without_caveats() {
-        let caps = capabilities_from(&x11(), &HELPERS_INSTALLED);
+        let caps = capabilities_from(&x11(), &HELPERS_INSTALLED, granted());
         for capability in Capability::ALL {
             assert_eq!(
                 caps.get(capability),
@@ -463,7 +559,7 @@ mod tests {
     /// `desktop capabilities` promised a route the code never took.
     #[test]
     fn window_capture_under_wayland_is_refused_because_the_capture_path_refuses_it() {
-        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED);
+        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED, granted());
         assert!(!caps.is_available(Capability::WindowScreenshots));
     }
 
@@ -472,7 +568,7 @@ mod tests {
     /// against, which is a different question and belongs in the note.
     #[test]
     fn a_portal_capability_away_from_gnome_says_it_is_untested_there() {
-        let caps = capabilities_from(&kde_wayland_with_portals(), &HELPERS_INSTALLED);
+        let caps = capabilities_from(&kde_wayland_with_portals(), &HELPERS_INSTALLED, granted());
         for capability in [Capability::Mouse, Capability::Screenshots] {
             match caps.get(capability) {
                 CapabilityState::Degraded { note } => {
@@ -484,12 +580,17 @@ mod tests {
         }
     }
 
+    /// Read before the grant, where there is still a note to inspect: on GNOME
+    /// it says only that a dialog is coming, never that the backend is
+    /// untested. After the grant there is no note at all, which the test above
+    /// covers.
     #[test]
     fn the_same_capability_on_gnome_carries_no_untested_caveat() {
-        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED);
+        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED, Grants::default());
         match caps.get(Capability::Mouse) {
             CapabilityState::Degraded { note } => {
                 assert!(!note.contains("untested"), "got {note}");
+                assert!(note.contains("approval"), "got {note}");
             }
             other => panic!("expected degraded, got {other:?}"),
         }
@@ -497,7 +598,7 @@ mod tests {
 
     #[test]
     fn gnome_wayland_window_listing_is_degraded_because_at_spi_cannot_see_everything() {
-        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED);
+        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED, granted());
         match caps.get(Capability::Windows) {
             CapabilityState::Degraded { note } => {
                 assert!(note.contains("stacking order"), "got {note}");
@@ -508,7 +609,7 @@ mod tests {
 
     #[test]
     fn kde_wayland_refuses_input_and_capture_but_keeps_accessibility() {
-        let caps = capabilities_from(&kde_wayland(), &HELPERS_INSTALLED);
+        let caps = capabilities_from(&kde_wayland(), &HELPERS_INSTALLED, granted());
         assert!(caps.is_available(Capability::Accessibility));
         assert!(caps.is_available(Capability::ElementActions));
         assert!(!caps.is_available(Capability::Mouse));
@@ -520,7 +621,7 @@ mod tests {
     fn a_missing_a11y_bus_is_reported_as_a_service_problem_not_a_missing_feature() {
         let mut broken = x11();
         broken.accessibility = Backend::None;
-        let caps = capabilities_from(&broken, &HELPERS_INSTALLED);
+        let caps = capabilities_from(&broken, &HELPERS_INSTALLED, granted());
         assert_eq!(
             caps.get(Capability::Accessibility),
             CapabilityState::unsupported(UnsupportedReason::ServiceUnavailable {
