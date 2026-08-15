@@ -618,6 +618,11 @@ mod tests {
         let _ = driver.store().clear();
     }
 
+    /// Compares everything except the display stamp, which `save` fills in
+    /// from the environment and the returned snapshot does not carry — so
+    /// asserting on the whole value would pass or fail depending on whether
+    /// the machine running it has a `DISPLAY`. That the stamp is written at
+    /// all is [`crate::SessionStore`]'s to prove, and it does.
     #[test]
     fn snapshotting_persists_the_result_for_the_next_process() {
         let ports = FakePorts::new().with_button("Save");
@@ -625,7 +630,10 @@ mod tests {
         let taken = driver
             .snapshot(&Target::Focused, WalkBudget::default(), false)
             .expect("snapshots");
-        let reloaded = driver.store().load().expect("reloads");
+
+        let mut reloaded = driver.store().load().expect("reloads");
+        reloaded.display = None;
+
         assert_eq!(reloaded, taken);
         let _ = driver.store().clear();
     }

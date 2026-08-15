@@ -342,12 +342,20 @@ mod tests {
         let _ = store.clear();
     }
 
+    /// Names the display on both sides rather than letting the environment
+    /// supply it, so the assertion holds whether or not the machine running it
+    /// has a `DISPLAY`. Using `save`/`load` here would compare a stamped
+    /// snapshot against an unstamped one on a developer's desktop and pass on
+    /// a bare runner, which is the failure this suite keeps finding.
     #[test]
     fn a_snapshot_survives_the_round_trip_that_spans_two_processes() {
         let store = temp_store("round-trip");
-        let original = snapshot_with_element();
-        store.save(&original).expect("saves");
-        let loaded = store.load().expect("loads");
+        let mut original = snapshot_with_element();
+        original.display = Some(":90".to_owned());
+
+        store.save_on(&original, Some(":90")).expect("saves");
+        let loaded = store.load_on(Some(":90")).expect("loads");
+
         assert_eq!(loaded, original);
         let _ = store.clear();
     }

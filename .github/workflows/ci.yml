@@ -22,6 +22,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
+      # The same suite again with a display named, which is the state of a
+      # developer's machine and not of this runner. A unit test that reads the
+      # environment passes in one and fails in the other, and this job has
+      # already been green while `cargo test` was broken for everyone with a
+      # desktop. No X server is started: nothing here should be looking.
+      - name: tests do not depend on there being a display
+        run: DISPLAY=:99 cargo test --workspace
       - run: cargo clippy --workspace --all-targets
       - name: architecture gates
         run: cargo xtask architecture
