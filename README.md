@@ -201,7 +201,7 @@ Run `desktop capabilities` on the machine in question — it reports this table
 for your actual session. `✓` supported, `~` supported with a caveat, `✗` not
 available.
 
-| | macOS | Linux / X11 | GNOME / Wayland | KDE, wlroots, other Wayland | agent session |
+| | macOS | Linux / X11 | GNOME / Wayland | wlroots, other Wayland | agent session |
 |---|---|---|---|---|---|
 | accessibility tree | ✓ | ✓ | ✓ | ✓ | ✓ |
 | element actions | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -213,6 +213,10 @@ available.
 | focus | ✓ | ✓ | ~ | ~ | ✓ |
 | agent session | ✗ | ✓ | ✓ | ✓ | — |
 
+**KDE is not on this table because it is not supported.** Every command that
+would touch a KDE desktop refuses with `unsupported_capability`; see
+[below](#kde-is-not-supported). `desktop session` still works there.
+
 The accessibility tree is the one row that is green everywhere, because AT-SPI
 is D-Bus and never talks to the compositor. That is also why it carries window
 enumeration on Wayland, where no protocol lets a client enumerate anything else.
@@ -221,9 +225,9 @@ EWMH and AT-SPI is joined onto it for the tree: `desktop info` reports `windows:
 ewmh` there and `windows: at-spi` under Wayland.
 
 The fourth column is `~` rather than `✗` because the portals are freedesktop's
-rather than GNOME's, and are now selected wherever a session advertises them.
-What that column does *not* have is verification: the caveat on every cell in it
-is that this build has only been run against GNOME's portal backend.
+rather than GNOME's, and are selected wherever a session advertises them. What
+that column does *not* have is verification: the caveat on every cell in it is
+that this build has only been run against GNOME's portal backend.
 
 The last column is the point of `desktop session`: an agent display is X11 that
 nobody else is using, so every row is green there regardless of what the user's
@@ -268,12 +272,45 @@ one window server per login and no supported way to make another.
   app ids — and `org.gnome.Shell.Screenshot` both check the caller against an
   allowlist containing the two portal implementations and nothing else. The
   portal is the whole of the sanctioned surface on GNOME.
-- **KDE and wlroots** also have native mechanisms upstream —
-  `org.kde.KWin.ScreenShot2`, `wlr-screencopy`, `zwlr_virtual_pointer_v1` — that
-  this build does not implement. They would buy what the portals cannot give:
-  per-window capture, and on wlroots a real window raise. Until then those two
-  rows stay `✗` there, refused with a structured error rather than falling
-  through to something that appears to work.
+- **wlroots** has native mechanisms upstream — `wlr-screencopy`,
+  `zwlr_virtual_pointer_v1`, `zwlr_foreign_toplevel_management_v1` — that this
+  build does not implement. They would buy what the portals cannot: per-window
+  capture, and a real window raise. Until then those rows stay `✗` there,
+  refused with a structured error rather than falling through to something that
+  appears to work.
+
+### KDE is not supported
+
+`desktop` refuses on KDE. Not partially, not with caveats: `desktop info` names
+the desktop, `desktop capabilities` marks every capability
+`unsupported_desktop`, and every command that would read or drive it exits 2
+with a structured error.
+
+KDE's own interfaces are shut to a program like this one.
+`org.kde.KWin.ScreenShot2` — which offers exactly what no other Wayland desktop
+does, per-window capture with no picker — answers
+`org.kde.KWin.ScreenShot2.Error.NoAuthorized` unless the caller was started from
+a desktop entry declaring `X-KDE-DBUS-Restricted-Interfaces`, which a
+command-line tool is not. Verified against KWin 6.7.4: the interface is there,
+version 5, all seven methods, and it refuses. Installing a declaring entry and
+rebuilding the service cache did not change the answer. KWin also implements
+none of the `ext-*` capture protocols, so there is no way round it.
+
+What would be left is the accessibility tree plus portal behaviour this build
+has never been run against — on a desktop that has already closed its own
+interfaces. That is how a tool ends up with a scattering of commands that work
+and no way to tell which; one clear refusal is worth more.
+
+The tree *does* work there, and saying so matters more than the decision:
+verified on KWin 6.7.4, `desktop apps`, `desktop windows` and a full
+`desktop snapshot` of a GTK4 application all answered correctly before support
+was removed. If that trade is wrong for you, the mechanism is one function —
+`is_supported` in `desktop_core::models::backend`.
+
+**`desktop session` is unaffected.** It starts an X11 display of its own with
+its own window manager, and nothing about the desktop you are running reaches
+inside it, so an agent gets every capability on a KDE machine exactly as it does
+anywhere else.
 
 ### Two things that are not fixable here
 
@@ -286,9 +323,10 @@ genuinely unknowable — never zero, which would read as a real position at the
 origin.
 
 **`ext-foreign-toplevel-list-v1` and `ext-image-copy-capture-v1` will not come
-to GNOME or KDE.** KDE closed the request `RESOLVED INTENTIONAL`; mutter has no
-plans. Those protocols are a wlroots-family path in practice, which is why the
-architecture has slots for them but the GNOME path uses portals.
+to GNOME.** Mutter has no plans, and KWin's `src/wayland` carries no
+implementation of them either. Those protocols are a wlroots-family path in
+practice, which is why the architecture has slots for them but the GNOME path
+uses portals.
 
 ---
 
@@ -554,7 +592,7 @@ do next:
   "backend": "none",
   "platform": "linux",
   "display_server": "wayland",
-  "desktop_environment": "kde"
+  "desktop_environment": "sway"
 }
 ```
 

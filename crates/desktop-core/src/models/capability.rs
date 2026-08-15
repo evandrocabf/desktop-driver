@@ -74,6 +74,15 @@ pub enum UnsupportedReason {
     ServiceUnavailable { service: String },
     /// The mechanism exists but this build does not implement it yet.
     NotImplemented,
+    /// This build does not support the desktop in hand, whatever its session
+    /// happens to advertise.
+    ///
+    /// Distinct from every other reason here: the others describe something
+    /// missing from the machine, and this one describes a decision. A caller
+    /// that reads `no_backend_mechanism` may reasonably install a portal
+    /// backend and try again; one that reads this should stop, or use
+    /// `desktop session`, which does not touch the desktop at all.
+    UnsupportedDesktop { desktop: String },
     /// An OS permission is missing. Distinct from the others because the user
     /// can fix it.
     PermissionMissing { permission: String },

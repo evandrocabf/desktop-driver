@@ -88,6 +88,11 @@ pub fn build_ports() -> Result<Ports> {
 ///
 /// No window activator is supplied under Wayland: raising a window is X11-only,
 /// and there is no protocol for it, so the refusal reaches the caller intact.
+///
+/// A desktop this build does not support selects no backends at all, and the
+/// tree is not read behind that decision. AT-SPI would answer perfectly well on
+/// KDE — that is precisely why the refusal has to be honoured here rather than
+/// left to whether a connection happens to succeed.
 pub fn build_ports_for(scope: &Scope) -> Result<Ports> {
     let wiring = Wiring::for_scope(scope)?;
     let mut info = wiring.info;
@@ -102,17 +107,21 @@ pub fn build_ports_for(scope: &Scope) -> Result<Ports> {
         };
 
     let accessibility: Box<dyn desktop_core::ports::AccessibilityPort> =
-        match a11y::AtSpi::connect_to(
-            wiring.a11y_address.as_deref(),
-            info.display_server == DisplayServer::Wayland,
-            info.clone(),
-        ) {
-            Ok(atspi) => Box::new(atspi.with_window_source(window_source)),
-            Err(error) => {
-                tracing::debug!(%error, "accessibility unavailable; other ports continue");
-                info.accessibility = Backend::None;
-                info.windows = Backend::None;
-                Box::new(unsupported::UnsupportedAccessibility::new(info.clone()))
+        if info.accessibility == Backend::None {
+            Box::new(unsupported::UnsupportedAccessibility::new(info.clone()))
+        } else {
+            match a11y::AtSpi::connect_to(
+                wiring.a11y_address.as_deref(),
+                info.display_server == DisplayServer::Wayland,
+                info.clone(),
+            ) {
+                Ok(atspi) => Box::new(atspi.with_window_source(window_source)),
+                Err(error) => {
+                    tracing::debug!(%error, "accessibility unavailable; other ports continue");
+                    info.accessibility = Backend::None;
+                    info.windows = Backend::None;
+                    Box::new(unsupported::UnsupportedAccessibility::new(info.clone()))
+                }
             }
         };
 

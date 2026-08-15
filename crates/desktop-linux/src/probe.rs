@@ -172,6 +172,21 @@ impl Grants {
     }
 }
 
+/// Whether the agent can be given a display of its own.
+///
+/// The one capability an unsupported desktop keeps, because it does not involve
+/// that desktop: the session is a private X server with its own window manager,
+/// and what the user happens to be running is not part of it.
+fn agent_session_state(missing_session_helpers: &[&str]) -> CapabilityState {
+    if missing_session_helpers.is_empty() {
+        CapabilityState::Supported
+    } else {
+        CapabilityState::unsupported(UnsupportedReason::ServiceUnavailable {
+            service: missing_session_helpers.join(", "),
+        })
+    }
+}
+
 /// A portal-backed capability, given whether its grant has been made.
 ///
 /// Once the desktop has recorded the approval there is no dialog left to warn
@@ -211,6 +226,20 @@ pub fn capabilities_from(
     grants: Grants,
 ) -> CapabilitySet {
     let mut set = CapabilitySet::new();
+
+    if !desktop_core::models::backend::is_supported(info.desktop_environment) {
+        let refused = CapabilityState::unsupported(UnsupportedReason::UnsupportedDesktop {
+            desktop: info.desktop_environment.as_str().to_owned(),
+        });
+        for capability in Capability::ALL {
+            set.set(capability, refused.clone());
+        }
+        set.set(
+            Capability::AgentSession,
+            agent_session_state(missing_session_helpers),
+        );
+        return set;
+    }
 
     let a11y_present = info.accessibility != Backend::None;
     set.set(
@@ -289,13 +318,7 @@ pub fn capabilities_from(
 
     set.set(
         Capability::AgentSession,
-        if missing_session_helpers.is_empty() {
-            CapabilityState::Supported
-        } else {
-            CapabilityState::unsupported(UnsupportedReason::ServiceUnavailable {
-                service: missing_session_helpers.join(", "),
-            })
-        },
+        agent_session_state(missing_session_helpers),
     );
 
     let input_state = match info.input {
@@ -325,6 +348,23 @@ pub fn capabilities_from(
 #[must_use]
 pub fn diagnostics_for(info: &BackendInfo, facts: SessionFacts) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+
+    if !desktop_core::models::backend::is_supported(info.desktop_environment) {
+        out.push(Diagnostic::error(
+            format!(
+                "{} is not a supported desktop, so every command that would touch it \
+                 refuses.",
+                info.desktop_environment.as_str()
+            ),
+            "KWin's own interfaces are closed to a command-line tool — \
+             org.kde.KWin.ScreenShot2 answers NoAuthorized without a declaring desktop \
+             entry — and it implements none of the ext-* capture protocols, which would \
+             leave this build guessing at portal behaviour it has never been run against. \
+             `desktop session` still works here: it starts an X11 display of its own and \
+             never touches your desktop.",
+        ));
+        return out;
+    }
 
     if info.accessibility == Backend::None {
         out.push(Diagnostic::error(
@@ -455,10 +495,10 @@ mod tests {
         )
     }
 
-    fn kde_wayland_with_portals() -> BackendInfo {
+    fn sway_wayland_with_portals() -> BackendInfo {
         info(
             DisplayServer::Wayland,
-            DesktopEnvironment::Kde,
+            DesktopEnvironment::Sway,
             Backend::AtSpi,
             Backend::XdgDesktopPortal,
             Backend::RemoteDesktopPortal,
@@ -550,11 +590,23 @@ mod tests {
         ));
     }
 
+    fn sway_wayland() -> BackendInfo {
+        info(
+            DisplayServer::Wayland,
+            DesktopEnvironment::Sway,
+            Backend::AtSpi,
+            Backend::None,
+            Backend::None,
+        )
+    }
+
+    /// What selection produces for a desktop this build refuses: nothing at
+    /// all, with the name kept so the refusal can say whose it is.
     fn kde_wayland() -> BackendInfo {
         info(
             DisplayServer::Wayland,
             DesktopEnvironment::Kde,
-            Backend::AtSpi,
+            Backend::None,
             Backend::None,
             Backend::None,
         )
@@ -600,11 +652,11 @@ mod tests {
     /// against, which is a different question and belongs in the note.
     #[test]
     fn a_portal_capability_away_from_gnome_says_it_is_untested_there() {
-        let caps = capabilities_from(&kde_wayland_with_portals(), &HELPERS_INSTALLED, granted());
+        let caps = capabilities_from(&sway_wayland_with_portals(), &HELPERS_INSTALLED, granted());
         for capability in [Capability::Mouse, Capability::Screenshots] {
             match caps.get(capability) {
                 CapabilityState::Degraded { note } => {
-                    assert!(note.contains("kde"), "{capability:?} note was {note}");
+                    assert!(note.contains("sway"), "{capability:?} note was {note}");
                 }
                 other => panic!("expected {capability:?} degraded, got {other:?}"),
             }
@@ -639,14 +691,59 @@ mod tests {
         }
     }
 
+    /// A Wayland session with no portal keeps the tree, which is
+    /// display-server independent, and refuses the rest.
     #[test]
-    fn kde_wayland_refuses_input_and_capture_but_keeps_accessibility() {
-        let caps = capabilities_from(&kde_wayland(), &HELPERS_INSTALLED, granted());
+    fn a_wayland_session_without_portals_refuses_input_and_capture_but_keeps_accessibility() {
+        let caps = capabilities_from(&sway_wayland(), &HELPERS_INSTALLED, granted());
         assert!(caps.is_available(Capability::Accessibility));
         assert!(caps.is_available(Capability::ElementActions));
         assert!(!caps.is_available(Capability::Mouse));
         assert!(!caps.is_available(Capability::Keyboard));
         assert!(!caps.is_available(Capability::Screenshots));
+    }
+
+    /// An unsupported desktop refuses everything it touches — the tree
+    /// included, which AT-SPI would have answered — and says which desktop it
+    /// is refusing rather than reporting a missing mechanism.
+    #[test]
+    fn an_unsupported_desktop_refuses_every_capability_that_touches_it() {
+        let caps = capabilities_from(&kde_wayland(), &HELPERS_INSTALLED, granted());
+        for capability in Capability::ALL {
+            if capability == Capability::AgentSession {
+                continue;
+            }
+            assert_eq!(
+                caps.get(capability),
+                CapabilityState::unsupported(UnsupportedReason::UnsupportedDesktop {
+                    desktop: "kde".to_owned()
+                }),
+                "{capability:?} should be refused as an unsupported desktop"
+            );
+        }
+    }
+
+    /// The one thing that survives, because it does not involve the desktop:
+    /// an agent session is a private X server with its own window manager.
+    #[test]
+    fn an_unsupported_desktop_can_still_be_given_an_agent_session() {
+        let caps = capabilities_from(&kde_wayland(), &HELPERS_INSTALLED, granted());
+        assert_eq!(
+            caps.get(Capability::AgentSession),
+            CapabilityState::Supported
+        );
+    }
+
+    /// `doctor` leads with the refusal and names the way forward, rather than
+    /// listing every mechanism the desktop is missing.
+    #[test]
+    fn doctor_explains_an_unsupported_desktop_in_one_finding() {
+        let notes = diagnostics_for(&kde_wayland(), SessionFacts::default());
+        assert_eq!(notes.len(), 1, "got {notes:?}");
+        assert_eq!(notes[0].severity, desktop_core::ports::Severity::Error);
+        assert!(notes[0].summary.contains("kde"), "got {:?}", notes[0]);
+        let remedy = notes[0].remedy.clone().unwrap_or_default();
+        assert!(remedy.contains("desktop session"), "got {remedy}");
     }
 
     #[test]
@@ -681,7 +778,7 @@ mod tests {
         // Writing org.a11y.Status.ScreenReaderEnabled launches Orca on GNOME.
         // Suggesting it would be actively harmful advice.
         let facts = SessionFacts::default();
-        for info in [x11(), gnome_wayland(), kde_wayland()] {
+        for info in [x11(), gnome_wayland(), sway_wayland()] {
             for diagnostic in diagnostics_for(&info, facts) {
                 let text = format!(
                     "{} {}",
@@ -699,7 +796,7 @@ mod tests {
 
     #[test]
     fn a_missing_wayland_input_backend_is_reported_as_an_error_with_an_explanation() {
-        let notes = diagnostics_for(&kde_wayland(), SessionFacts::default());
+        let notes = diagnostics_for(&sway_wayland(), SessionFacts::default());
         let found = notes
             .iter()
             .find(|d| d.summary.contains("No input backend"))
