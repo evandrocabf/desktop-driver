@@ -63,11 +63,20 @@ the binary and links the agent skill into whichever coding agents are present.
   platform traps are handled, but **it has not been run on hardware**. Treat it as unverified.
 - Linux is verified end to end on Fedora, Debian, Ubuntu, Arch and openSUSE by
   `scripts/distro-matrix.sh`.
-- Backends are selected from what a session advertises rather than from its name, so KDE, wlroots
-  and other non-GNOME Wayland compositors get the freedesktop portals their own desktop implements.
+- Backends are selected from what a session advertises rather than from its name, so wlroots and
+  other non-GNOME Wayland compositors get the freedesktop portals their own desktop implements.
   Only GNOME's portal backend has been run against, and every capability note away from GNOME says
   so. Where a portal is genuinely absent the refusal is still a structured error rather than an
   unverified path, and `desktop session` works there regardless.
+- **KDE is not supported.** Every capability on a KDE desktop reports
+  `unsupported_desktop` and every command that would touch it exits 2. KWin's own interfaces are
+  closed to a command-line tool — `org.kde.KWin.ScreenShot2` answers `NoAuthorized` without a
+  desktop entry declaring `X-KDE-DBUS-Restricted-Interfaces`, verified against KWin 6.7.4, and
+  installing such an entry did not change it — and KWin implements none of the `ext-*` capture
+  protocols. What remained would have been the accessibility tree plus unverified portal behaviour
+  on a desktop that had already closed its own doors. The tree itself does work there, measured on
+  KWin 6.7.4 before support was removed; `desktop session` is unaffected, since it never touches
+  the desktop.
 - Input under Wayland needs both the RemoteDesktop and ScreenCast portals, because absolute pointer
   positioning interprets its coordinates in a screencast stream's space. A session offering only one
   of the two reports no input backend instead of failing on its first click.

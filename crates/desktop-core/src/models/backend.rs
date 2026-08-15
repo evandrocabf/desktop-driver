@@ -202,15 +202,39 @@ pub fn select_display_server(facts: SessionFacts) -> DisplayServer {
     }
 }
 
+/// Whether this build drives a desktop at all.
+///
+/// KDE is refused outright. What its own compositor offers is shut to an
+/// ordinary program: `org.kde.KWin.ScreenShot2` answers `NoAuthorized` unless
+/// the caller was launched from a desktop entry declaring
+/// `X-KDE-DBUS-Restricted-Interfaces`, which a command-line tool is not, and
+/// KWin implements none of the `ext-*` capture protocols that would offer a way
+/// round it. Driving it would mean leaning entirely on portal behaviour this
+/// build has never been run against, on a desktop whose own interfaces have
+/// already been closed — so it says no, once, where the alternative is a
+/// scattering of half-working commands.
+///
+/// The refusal is about the *host* desktop. `desktop session` starts an X11
+/// display of its own, with its own window manager, and nothing about the
+/// user's desktop reaches inside it — which is why an agent session is still
+/// selected normally on a KDE machine.
+#[must_use]
+pub const fn is_supported(desktop: DesktopEnvironment) -> bool {
+    !matches!(desktop, DesktopEnvironment::Kde)
+}
+
 /// Chooses the four Linux mechanisms.
 ///
-/// Every choice is made from what the session *advertises*, never from its
-/// name. An earlier version gated the portals on GNOME, which left KDE and
-/// wlroots refusing mechanisms their own desktop implements — the freedesktop
-/// portal interfaces are not GNOME's, and a probe already establishes whether
-/// each one is present. What the desktop environment still decides is the
-/// wording of a capability note: GNOME's portal backend is the one this build
-/// has been verified against, and the rest say so.
+/// An unsupported desktop is refused before anything is probed — see
+/// [`is_supported`].
+///
+/// Every other choice is made from what the session *advertises*, never from
+/// its name. An earlier version gated the portals on GNOME, which left every
+/// other compositor refusing mechanisms its own desktop implements — the
+/// freedesktop portal interfaces are not GNOME's, and a probe already
+/// establishes whether each one is present. What a supported desktop's name
+/// still decides is the wording of a capability note: GNOME's portal backend is
+/// the one this build has been verified against, and the rest say so.
 ///
 /// Input requires *two* portals rather than one. Absolute pointer positioning
 /// interprets its coordinates in a PipeWire stream's logical space, so the
@@ -231,6 +255,18 @@ pub fn select_linux_backends(
     desktop: DesktopEnvironment,
     facts: SessionFacts,
 ) -> BackendInfo {
+    if !is_supported(desktop) {
+        return BackendInfo {
+            platform: Platform::Linux,
+            display_server,
+            desktop_environment: desktop,
+            accessibility: Backend::None,
+            windows: Backend::None,
+            screenshot: Backend::None,
+            input: Backend::None,
+        };
+    }
+
     let accessibility = if facts.a11y_bus {
         Backend::AtSpi
     } else {
@@ -402,14 +438,14 @@ mod tests {
         assert_eq!(info.windows, Backend::AtSpi);
     }
 
-    /// KDE's portal backend implements the same freedesktop interfaces GNOME's
-    /// does. Refusing them because `XDG_CURRENT_DESKTOP` said "KDE" withheld a
-    /// mechanism the machine was already running.
+    /// A supported desktop's portal backend implements the same freedesktop
+    /// interfaces GNOME's does. Refusing them on the strength of
+    /// `XDG_CURRENT_DESKTOP` withheld a mechanism the machine was running.
     #[test]
     fn a_desktop_is_given_the_portals_it_advertises_rather_than_the_ones_its_name_implies() {
         for desktop in [
-            DesktopEnvironment::Kde,
             DesktopEnvironment::Sway,
+            DesktopEnvironment::Hyprland,
             DesktopEnvironment::Unknown,
         ] {
             let info = select_linux_backends(DisplayServer::Wayland, desktop, gnome_wayland());
@@ -456,8 +492,39 @@ mod tests {
             screencast_portal: false,
             ..gnome_wayland()
         };
-        let info = select_linux_backends(DisplayServer::Wayland, DesktopEnvironment::Kde, facts);
+        let info = select_linux_backends(DisplayServer::Wayland, DesktopEnvironment::Sway, facts);
         assert_eq!(info.input, Backend::None);
+    }
+
+    /// KDE selects nothing at all, including the accessibility tree that AT-SPI
+    /// would have answered perfectly well. Half-supporting a desktop whose own
+    /// interfaces are closed is how a tool ends up with a scattering of
+    /// commands that work and no way to tell which.
+    #[test]
+    fn kde_selects_no_backend_whatever_its_session_advertises() {
+        let info = select_linux_backends(
+            DisplayServer::Wayland,
+            DesktopEnvironment::Kde,
+            gnome_wayland(),
+        );
+        assert_eq!(info.accessibility, Backend::None);
+        assert_eq!(info.windows, Backend::None);
+        assert_eq!(info.screenshot, Backend::None);
+        assert_eq!(info.input, Backend::None);
+        assert_eq!(
+            info.desktop_environment,
+            DesktopEnvironment::Kde,
+            "the desktop is still named, so the refusal can explain itself"
+        );
+    }
+
+    /// The refusal follows the desktop, not the display server: a KDE session
+    /// on X11 is as closed as one on Wayland.
+    #[test]
+    fn kde_is_refused_under_x11_too() {
+        let info = select_linux_backends(DisplayServer::X11, DesktopEnvironment::Kde, plain_x11());
+        assert_eq!(info.accessibility, Backend::None);
+        assert_eq!(info.screenshot, Backend::None);
     }
 
     #[test]

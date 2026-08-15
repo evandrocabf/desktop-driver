@@ -241,6 +241,9 @@ fn describe_reason(reason: &desktop_core::models::capability::UnsupportedReason)
         Reason::ServiceUnavailable { service } => format!("{service} is not reachable"),
         Reason::NotImplemented => "not implemented in this build".to_owned(),
         Reason::PermissionMissing { permission } => format!("{permission} has not been granted"),
+        Reason::UnsupportedDesktop { desktop } => {
+            format!("{desktop} is not a desktop this build supports")
+        }
     }
 }
 
