@@ -321,6 +321,7 @@ pub fn start(options: StartOptions, store: &AgentSessionStore) -> Result<AgentSe
             options,
             server,
             xauthority: &xauthority,
+            cookie: &cookie,
             home: home.as_deref(),
             launcher: &launcher,
             registryd: &registryd,
@@ -369,6 +370,9 @@ struct Plan<'a> {
     options: StartOptions,
     server: XServer,
     xauthority: &'a Path,
+    /// The display's cookie, for connecting back to it before any environment
+    /// variable names it.
+    cookie: &'a [u8],
     home: Option<&'a Path>,
     launcher: &'a Path,
     registryd: &'a Path,
@@ -395,6 +399,7 @@ fn assemble(plan: &Plan<'_>, started: &mut Vec<(String, Child)>) -> Result<(Stri
         options,
         server,
         xauthority,
+        cookie,
         home,
         launcher,
         registryd,
@@ -484,8 +489,29 @@ fn assemble(plan: &Plan<'_>, started: &mut Vec<(String, Child)>) -> Result<(Stri
 
     let child = spawn_service(Path::new("openbox"), &[], &with_bus)?;
     started.push(("openbox".to_owned(), child));
+    wait_for_window_manager(display, cookie)?;
 
     Ok((dbus_address, a11y_address))
+}
+
+/// Waits until the window manager has published the EWMH properties.
+///
+/// Spawning `openbox` is not the same as it having taken over the display, and
+/// the gap is wide enough to be observed: the first command after `session
+/// start` saw a display nothing was managing, so it reported the window list as
+/// degraded and fell back to AT-SPI frames. Both answers were true at the
+/// instant they were given, which is exactly what makes waiting the fix.
+fn wait_for_window_manager(display: &str, cookie: &[u8]) -> Result<()> {
+    let target = crate::x11::DisplayTarget {
+        display: Some(display.to_owned()),
+        cookie: Some(cookie.to_vec()),
+    };
+    wait_until(|| crate::x11::supports_ewmh(&target)).map_err(|()| {
+        DesktopError::backend(format!(
+            "openbox started but did not manage {display} within {}s",
+            STARTUP_TIMEOUT.as_secs()
+        ))
+    })
 }
 
 /// Starts the private bus and reads back the address it printed.

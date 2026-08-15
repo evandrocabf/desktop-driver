@@ -6,13 +6,19 @@
 //! Wayland, where no window-listing protocol is available to an ordinary
 //! client.
 //!
+//! Under X11 it is the *junior* partner for that one job: the window manager
+//! knows about every window, including those belonging to applications with no
+//! accessibility support at all, and knows their stacking order and their real
+//! screen position. So the two are joined — see [`AtSpi::window_table`] — with
+//! EWMH deciding which windows exist and AT-SPI supplying the tree behind each.
+//!
 //! The coordinate caveat is load-bearing and is handled in [`extents`]: under
 //! Wayland a toolkit cannot know its own screen position, so
 //! `GetExtents(Screen)` returns surface-relative numbers. Rather than pass
 //! those off as screen coordinates, the adapter reports the space it is
 //! actually working in and lets the core carry that through to the snapshot.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use atspi::{
     CoordType, Interface, ObjectRefOwned, State, StateSet,
@@ -57,8 +63,9 @@ pub struct AtSpi {
     window_relative: bool,
     /// Carried so a refusal can name the environment that refused.
     info: desktop_core::models::backend::BackendInfo,
-    /// How to raise a window, where the display server permits it at all.
-    activator: Option<Box<dyn crate::x11::WindowActivator>>,
+    /// The window manager, where the display server has one this can talk to.
+    /// Supplies the window list and the only reliable way to raise a window.
+    windows: Option<Box<dyn crate::x11::WindowSource>>,
 }
 
 impl AtSpi {
@@ -102,17 +109,17 @@ impl AtSpi {
             space: CoordinateSpace::primary_screen(),
             window_relative,
             info,
-            activator: None,
+            windows: None,
         })
     }
 
-    /// Supplies the window manager to raise windows through.
+    /// Supplies the window manager to enumerate and raise windows through.
     #[must_use]
-    pub fn with_activator(
+    pub fn with_window_source(
         mut self,
-        activator: Option<Box<dyn crate::x11::WindowActivator>>,
+        windows: Option<Box<dyn crate::x11::WindowSource>>,
     ) -> Self {
-        self.activator = activator;
+        self.windows = windows;
         self
     }
 
@@ -253,47 +260,145 @@ impl AtSpi {
         Ok(windows)
     }
 
-    /// Finds the window a target designates.
-    async fn locate(&self, target: &Target) -> Result<(AppEntry, WindowEntry)> {
-        let apps = self.applications().await?;
+    /// Every window on this display, in one order, numbered once.
+    ///
+    /// This is the single answer to "which windows are there": `desktop
+    /// windows` prints it and `--window N` indexes it. They used to be two
+    /// separate walks numbered independently, so `desktop windows --app
+    /// Firefox` printed ids that `--window` then resolved against a different,
+    /// unfiltered list — the second window of the second application answered
+    /// to whichever id its position in the *filtered* list happened to give it.
+    ///
+    /// Where a window manager is available it decides which windows exist, in
+    /// what order, and where they are; AT-SPI supplies the tree behind each.
+    /// That is what makes an application with no accessibility support appear
+    /// here at all, and the row says so — see [`Window::accessible`].
+    ///
+    /// The EWMH rows come first and in the window manager's order, and nothing
+    /// may reorder them: capture resolves a `WindowId` back to an `XID` by
+    /// recomputing that list in another process, with no access to this one's
+    /// AT-SPI join. Frames the window manager did not account for follow after.
+    /// Under Wayland that is every window; under X11 it is an application whose
+    /// accessibility frame outlived its window, or one that was never managed.
+    ///
+    /// Windows with no frame are numbered from past the AT-SPI indices already
+    /// in use for their application, so the two cannot collide in a
+    /// [`WindowKey`](desktop_core::models::app::WindowKey).
+    async fn window_table(&self) -> Result<Vec<Row>> {
+        let mut frames: Vec<Option<(AppEntry, WindowEntry)>> = Vec::new();
+        for app in self.applications().await? {
+            for window in self.windows_of(&app).await? {
+                frames.push(Some((app.clone(), window)));
+            }
+        }
 
-        let candidates: Vec<&AppEntry> = match target {
-            Target::App(needle) => apps
-                .iter()
-                .filter(|app| app.key().matches(needle))
-                .collect(),
-            Target::Focused | Target::Window(_) => apps.iter().collect(),
+        let managed = match &self.windows {
+            Some(source) if self.info.windows == desktop_core::models::backend::Backend::Ewmh => {
+                source.toplevels()?
+            }
+            _ => Vec::new(),
         };
 
-        if candidates.is_empty() {
-            return Err(DesktopError::TargetNotFound {
-                target: target.describe(),
+        let mut ordinals: HashMap<i32, u16> =
+            frames
+                .iter()
+                .flatten()
+                .fold(HashMap::new(), |mut counts, (app, _)| {
+                    *counts.entry(app.pid.get()).or_insert(0) += 1;
+                    counts
+                });
+
+        let mut rows = Vec::new();
+        for window in &managed {
+            let frame = claim_frame(&mut frames, window);
+            let app = match &frame {
+                Some((app, _)) => app.key(),
+                None => fallback_key(window),
+            };
+            let index = match &frame {
+                Some((_, entry)) => entry.index,
+                None => {
+                    let next = ordinals.entry(app.pid.get()).or_insert(0);
+                    let index = *next;
+                    *next = next.saturating_add(1);
+                    index
+                }
+            };
+            rows.push(Row {
+                id: WindowId::new(0),
+                title: window
+                    .title
+                    .clone()
+                    .or_else(|| frame.as_ref().and_then(|(_, entry)| entry.title.clone())),
+                app,
+                bounds: window.bounds,
+                focused: window.focused,
+                minimized: window.minimized,
+                index,
+                frame,
             });
         }
 
-        let mut all = Vec::new();
-        for app in candidates {
-            for window in self.windows_of(app).await? {
-                all.push((app.clone(), window));
-            }
+        for frame in frames.into_iter().flatten() {
+            let bounds = self.extents(&frame.1.object).await;
+            rows.push(Row {
+                id: WindowId::new(0),
+                title: frame.1.title.clone(),
+                app: frame.1.app.clone(),
+                bounds,
+                focused: frame.1.focused,
+                minimized: false,
+                index: frame.1.index,
+                frame: Some(frame),
+            });
         }
 
-        match target {
-            Target::Window(id) => {
-                all.into_iter()
-                    .nth(id.get() as usize)
-                    .ok_or_else(|| DesktopError::TargetNotFound {
-                        target: target.describe(),
-                    })
-            }
-            Target::Focused | Target::App(_) => all
-                .iter()
-                .find(|(_, window)| window.focused)
-                .cloned()
-                .or_else(|| all.first().cloned())
-                .ok_or_else(|| DesktopError::TargetNotFound {
-                    target: target.describe(),
-                }),
+        for (position, row) in rows.iter_mut().enumerate() {
+            row.id = WindowId::new(u32::try_from(position).unwrap_or(u32::MAX));
+        }
+        Ok(rows)
+    }
+
+    /// Finds the window a target designates.
+    ///
+    /// Only rows with a tree can be returned, because every caller needs one.
+    /// A window that exists without a tree is reported as exactly that rather
+    /// than as missing: the difference is whether the agent should look for
+    /// another window or stop using the accessibility route for this one.
+    async fn locate(&self, target: &Target) -> Result<Row> {
+        let table = self.window_table().await?;
+        let candidates: Vec<Row> = match target {
+            Target::Window(id) => table.into_iter().filter(|row| row.id == *id).collect(),
+            Target::App(needle) => table
+                .into_iter()
+                .filter(|row| row.app.matches(needle))
+                .collect(),
+            Target::Focused => table,
+        };
+
+        let chosen = candidates
+            .iter()
+            .position(|row| row.focused && row.frame.is_some())
+            .or_else(|| candidates.iter().position(|row| row.frame.is_some()));
+
+        match chosen {
+            Some(position) => Ok(candidates
+                .into_iter()
+                .nth(position)
+                .expect("position came from this list")),
+            None if candidates.is_empty() => Err(DesktopError::TargetNotFound {
+                target: target.describe(),
+            }),
+            None => Err(DesktopError::TargetNotFound {
+                target: format!(
+                    "an accessibility tree for {} (the window manager reports it, but {} \
+                     exposes none, so it can only be screenshotted or clicked by coordinate)",
+                    target.describe(),
+                    candidates
+                        .first()
+                        .map_or("its application", |row| row.app.name.as_str())
+                ),
+            }),
         }
     }
 
@@ -498,7 +603,9 @@ impl AtSpi {
             .await
             .map_err(|_| DesktopError::TargetNotFound {
                 target: format!("application {:?}", target.app.name),
-            })?;
+            })?
+            .frame
+            .expect("locate returns rows with a tree");
 
         let mut visited = 0;
         let mut seen = HashSet::new();
@@ -548,6 +655,74 @@ struct WindowEntry {
     app: AppKey,
 }
 
+/// One row of the window table.
+struct Row {
+    id: WindowId,
+    title: Option<String>,
+    app: AppKey,
+    bounds: Option<Bounds>,
+    focused: bool,
+    minimized: bool,
+    index: u16,
+    /// The AT-SPI frame behind this window, absent where the application
+    /// exposes none.
+    frame: Option<(AppEntry, WindowEntry)>,
+}
+
+/// Takes the AT-SPI frame describing the same window as `window`, if one is
+/// still unclaimed.
+///
+/// Pid *and* title first, since one application has a single pid across all of
+/// its windows and the title is what tells them apart. Pid alone next, in list
+/// order, which is the best available guess when the two reads caught a title
+/// mid-change. Title alone last, for an application that publishes no
+/// `_NET_WM_PID` — Java toolkits and anything running over an X11 forward.
+fn claim_frame(
+    frames: &mut [Option<(AppEntry, WindowEntry)>],
+    window: &crate::x11::ManagedWindow,
+) -> Option<(AppEntry, WindowEntry)> {
+    let pid = window.pid.and_then(|pid| i32::try_from(pid).ok());
+    let same_pid = |entry: &(AppEntry, WindowEntry)| pid == Some(entry.0.pid.get());
+    let same_title =
+        |entry: &(AppEntry, WindowEntry)| window.title.is_some() && entry.1.title == window.title;
+
+    let position = frames
+        .iter()
+        .position(|slot| {
+            slot.as_ref()
+                .is_some_and(|entry| same_pid(entry) && same_title(entry))
+        })
+        .or_else(|| {
+            frames
+                .iter()
+                .position(|slot| slot.as_ref().is_some_and(&same_pid))
+        })
+        .or_else(|| {
+            frames
+                .iter()
+                .position(|slot| slot.as_ref().is_some_and(&same_title))
+        })?;
+    frames[position].take()
+}
+
+/// Names an application that is on screen but not on the accessibility bus.
+///
+/// `WM_CLASS` is what a window manager and a taskbar use for the same purpose.
+/// A pid of 0 means the window published none — the same convention the AT-SPI
+/// side already uses when D-Bus cannot resolve one.
+fn fallback_key(window: &crate::x11::ManagedWindow) -> AppKey {
+    let pid = window
+        .pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .unwrap_or_default();
+    let name = window
+        .class
+        .as_deref()
+        .or(window.title.as_deref())
+        .unwrap_or("(unknown)");
+    AppKey::new(ProcessId::new(pid), name)
+}
+
 impl AccessibilityPort for AtSpi {
     fn list_apps(&self) -> Result<Vec<Application>> {
         runtime::try_block_on(async {
@@ -567,43 +742,44 @@ impl AccessibilityPort for AtSpi {
 
     /// The windows of one application, or of all of them.
     ///
-    /// Bounds come from AT-SPI, which under Wayland reports them
-    /// window-relative — meaningless as a screen position. The driver reports
-    /// the coordinate space alongside them so nothing downstream misreads
-    /// them as absolute.
+    /// Filtering happens *after* the table is numbered, so an id printed under
+    /// `--app` is the same id `--window` resolves.
+    ///
+    /// Bounds come from the window manager where there is one, and from AT-SPI
+    /// otherwise — which under Wayland reports them window-relative, meaningless
+    /// as a screen position. The driver reports the coordinate space alongside
+    /// them so nothing downstream misreads them as absolute.
     fn list_windows(&self, app: Option<&AppKey>) -> Result<Vec<Window>> {
         runtime::try_block_on(async {
-            let apps = self.applications().await?;
-            let mut out = Vec::new();
-            let mut next_id = 0u32;
-
-            for entry in apps {
-                if let Some(filter) = app
-                    && !entry.key().matches(&filter.name)
-                {
-                    continue;
-                }
-                for window in self.windows_of(&entry).await? {
-                    let bounds = self.extents(&window.object).await;
-                    out.push(Window {
-                        id: WindowId::new(next_id),
-                        title: window.title.clone(),
-                        app: window.app.clone(),
-                        bounds,
-                        focused: window.focused,
-                        minimized: false,
-                        index: window.index,
-                    });
-                    next_id += 1;
-                }
-            }
-            Ok(out)
+            let table = self.window_table().await?;
+            Ok(table
+                .into_iter()
+                .filter(|row| app.is_none_or(|filter| row.app.matches(&filter.name)))
+                .map(|row| Window {
+                    id: row.id,
+                    title: row.title,
+                    app: row.app,
+                    bounds: row.bounds,
+                    focused: row.focused,
+                    minimized: row.minimized,
+                    accessible: row.frame.is_some(),
+                    index: row.index,
+                })
+                .collect())
         })?
     }
 
+    /// The window a target designates, plus its tree.
+    ///
+    /// The window a coordinate is relative to is named by its table id, which
+    /// is what `desktop windows` printed and what `--window` accepts. It used
+    /// to be the window's ordinal within its own application, so
+    /// `{"window": 1}` on a snapshot of the second application's second window
+    /// named the wrong window entirely.
     fn tree(&self, target: &Target, budget: WalkBudget) -> Result<ResolvedTree> {
         runtime::try_block_on(async {
-            let (app, window) = self.locate(target).await?;
+            let row = self.locate(target).await?;
+            let (app, window) = row.frame.clone().expect("locate returns rows with a tree");
             let mut visited = 0;
             let mut seen = HashSet::new();
             let root = self
@@ -614,7 +790,7 @@ impl AccessibilityPort for AtSpi {
                 })?;
 
             let space = if self.window_relative {
-                CoordinateSpace::Window(WindowId::new(u32::from(window.index)))
+                CoordinateSpace::Window(row.id)
             } else {
                 self.space
             };
@@ -622,12 +798,13 @@ impl AccessibilityPort for AtSpi {
             Ok(ResolvedTree {
                 app: app.key(),
                 window: Window {
-                    id: WindowId::new(u32::from(window.index)),
-                    title: window.title.clone(),
-                    app: window.app.clone(),
+                    id: row.id,
+                    title: row.title.clone(),
+                    app: row.app.clone(),
                     bounds: root.bounds,
-                    focused: window.focused,
-                    minimized: false,
+                    focused: row.focused,
+                    minimized: row.minimized,
+                    accessible: true,
                     index: window.index,
                 },
                 root,
@@ -744,9 +921,10 @@ impl AccessibilityPort for AtSpi {
     /// did not occur would send every later keystroke to the wrong window,
     /// which is why the window is checked for the active state afterwards.
     fn focus(&self, target: &Target) -> Result<()> {
-        let (app, window) = runtime::try_block_on(self.locate(target))??;
+        let row = runtime::try_block_on(self.locate(target))??;
+        let (app, window) = row.frame.clone().expect("locate returns rows with a tree");
 
-        if let Some(activator) = &self.activator
+        if let Some(activator) = &self.windows
             && activator.activate(u32::try_from(app.pid.get()).ok(), window.title.as_deref())?
         {
             self.settle(&window.object);
@@ -859,6 +1037,108 @@ fn format_number(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::x11::ManagedWindow;
+
+    fn frame(pid: i32, app: &str, title: Option<&str>, index: u16) -> (AppEntry, WindowEntry) {
+        let object = parse_native(":1.7/org/a11y/atspi/accessible/1").expect("a valid handle");
+        (
+            AppEntry {
+                object: object.clone(),
+                bus_name: ":1.7".to_owned(),
+                name: app.to_owned(),
+                pid: ProcessId::new(pid),
+                child_count: 1,
+            },
+            WindowEntry {
+                object,
+                title: title.map(str::to_owned),
+                focused: false,
+                index,
+                app: AppKey::new(ProcessId::new(pid), app),
+            },
+        )
+    }
+
+    fn managed(pid: Option<u32>, title: Option<&str>, class: Option<&str>) -> ManagedWindow {
+        ManagedWindow {
+            xid: 0x40_0001,
+            pid,
+            title: title.map(str::to_owned),
+            class: class.map(str::to_owned),
+            bounds: None,
+            minimized: false,
+            focused: false,
+        }
+    }
+
+    /// One application has a single pid across every window it owns, so the
+    /// title is the only thing telling them apart.
+    #[test]
+    fn a_frame_is_claimed_by_pid_and_title_before_pid_alone() {
+        let mut frames = vec![
+            Some(frame(42, "Firefox", Some("GitHub"), 0)),
+            Some(frame(42, "Firefox", Some("Crates.io"), 1)),
+        ];
+        let claimed = claim_frame(&mut frames, &managed(Some(42), Some("Crates.io"), None))
+            .expect("a frame matches");
+        assert_eq!(claimed.1.index, 1);
+    }
+
+    #[test]
+    fn a_claimed_frame_is_not_offered_to_the_next_window() {
+        let mut frames = vec![
+            Some(frame(42, "Firefox", Some("GitHub"), 0)),
+            Some(frame(42, "Firefox", Some("GitHub"), 1)),
+        ];
+        let first = claim_frame(&mut frames, &managed(Some(42), Some("GitHub"), None));
+        let second = claim_frame(&mut frames, &managed(Some(42), Some("GitHub"), None));
+        let third = claim_frame(&mut frames, &managed(Some(42), Some("GitHub"), None));
+        assert_eq!(first.expect("first matches").1.index, 0);
+        assert_eq!(second.expect("second matches").1.index, 1);
+        assert!(third.is_none(), "there were only two frames");
+    }
+
+    /// Java toolkits and anything running over an X11 forward publish no
+    /// `_NET_WM_PID`, which leaves the title as the only join.
+    #[test]
+    fn a_window_with_no_pid_falls_back_to_matching_on_title() {
+        let mut frames = vec![Some(frame(42, "IntelliJ", Some("Main.java"), 0))];
+        let claimed =
+            claim_frame(&mut frames, &managed(None, Some("Main.java"), None)).expect("matches");
+        assert_eq!(claimed.0.name, "IntelliJ");
+    }
+
+    #[test]
+    fn a_window_whose_application_exposes_nothing_claims_no_frame() {
+        let mut frames = vec![Some(frame(42, "Firefox", Some("GitHub"), 0))];
+        assert!(claim_frame(&mut frames, &managed(Some(99), Some("xclock"), None)).is_none());
+        assert!(
+            frames[0].is_some(),
+            "the unrelated frame must be left alone"
+        );
+    }
+
+    /// Two windows with neither a pid nor a title in common must not be joined
+    /// on the strength of both being untitled.
+    #[test]
+    fn an_untitled_window_does_not_match_an_untitled_frame_by_default() {
+        let mut frames = vec![Some(frame(42, "Firefox", None, 0))];
+        assert!(claim_frame(&mut frames, &managed(None, None, None)).is_none());
+    }
+
+    #[test]
+    fn an_application_with_no_tree_is_named_by_its_wm_class() {
+        let key = fallback_key(&managed(Some(1234), Some("xclock"), Some("XClock")));
+        assert_eq!(key.name, "XClock");
+        assert_eq!(key.pid.get(), 1234);
+    }
+
+    #[test]
+    fn a_window_with_neither_class_nor_pid_still_produces_a_usable_key() {
+        let key = fallback_key(&managed(None, None, None));
+        assert_eq!(key.name, "(unknown)");
+        assert_eq!(key.pid.get(), 0);
+    }
 
     #[test]
     fn window_roles_cover_the_shapes_toolkits_actually_report() {

@@ -590,6 +590,11 @@ pub fn render_apps(sink: &mut Sink<'_>, apps: &[Application]) -> Rendered {
 ///
 /// A window with no bounds prints as absent rather than as zero: under Wayland
 /// no client can learn its own position.
+/// Prints the window table.
+///
+/// A window the window manager reports but AT-SPI cannot see is listed and
+/// labelled rather than hidden: it is on screen, and an agent that cannot
+/// snapshot it should learn that here rather than from a failure.
 pub fn render_windows(sink: &mut Sink<'_>, windows: &[Window]) -> Rendered {
     if sink.is_json() {
         sink.value(&json!({ "windows": windows }));
@@ -605,12 +610,17 @@ pub fn render_windows(sink: &mut Sink<'_>, windows: &[Window]) -> Rendered {
             || "position unavailable".to_owned(),
             |b| format!("{}x{} at {},{}", b.width, b.height, b.x, b.y),
         );
+        let notes = match (window.minimized, window.accessible) {
+            (false, true) => String::new(),
+            (true, true) => "  (minimized)".to_owned(),
+            (false, false) => "  (no accessibility tree)".to_owned(),
+            (true, false) => "  (minimized, no accessibility tree)".to_owned(),
+        };
         sink.line(&format!(
-            "{focus} [{}] {:<40} {:<24} {}",
+            "{focus} [{}] {:<40} {:<24} {geometry}{notes}",
             window.id,
             window.title.as_deref().unwrap_or("(untitled)"),
             window.app.name,
-            geometry
         ));
     }
     Ok(())
@@ -779,7 +789,7 @@ mod tests {
             desktop_environment: DesktopEnvironment::Gnome,
             accessibility: Backend::AtSpi,
             windows: Backend::AtSpi,
-            screenshot: Backend::PortalScreenCast,
+            screenshot: Backend::XdgDesktopPortal,
             input: Backend::RemoteDesktopPortal,
         }
     }
@@ -794,7 +804,7 @@ mod tests {
         assert_eq!(parsed["display_server"], "wayland");
         assert_eq!(parsed["desktop_environment"], "gnome");
         assert_eq!(parsed["accessibility"], "at-spi");
-        assert_eq!(parsed["screenshot"], "portal-screencast");
+        assert_eq!(parsed["screenshot"], "xdg-desktop-portal");
         assert_eq!(parsed["input"], "remote-desktop-portal");
     }
 
@@ -830,6 +840,7 @@ mod tests {
             bounds: None,
             focused: true,
             minimized: false,
+            accessible: true,
             index: 0,
         };
         let text = capture(false, |sink| {

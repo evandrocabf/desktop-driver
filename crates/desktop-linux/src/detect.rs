@@ -31,6 +31,7 @@ pub fn session_facts() -> SessionFacts {
         session_type_x11: session_type.eq_ignore_ascii_case("x11"),
         a11y_bus: probe_a11y_bus(),
         atspi_enabled: atspi_enabled(),
+        ewmh: probe_ewmh(),
         screencast_portal: probe_portal_interface("ScreenCast"),
         remote_desktop_portal: probe_portal_interface("RemoteDesktop"),
         screenshot_portal: probe_portal_interface("Screenshot"),
@@ -73,6 +74,10 @@ pub fn detect() -> BackendInfo {
 /// there is no display server to guess at and no XWayland trap to avoid. The
 /// portals are deliberately absent — they belong to the user's login session
 /// and would capture the user's screen, which is the opposite of the point.
+///
+/// The window manager is the one thing still probed rather than assumed: a
+/// session starts `openbox`, and a session whose `openbox` failed to start
+/// would otherwise report window listing as working and then list nothing.
 #[must_use]
 pub fn session_facts_for(session: &desktop_core::agent::AgentSession) -> SessionFacts {
     SessionFacts {
@@ -82,6 +87,10 @@ pub fn session_facts_for(session: &desktop_core::agent::AgentSession) -> Session
         session_type_x11: true,
         a11y_bus: a11y_bus_reachable(&session.a11y_address),
         atspi_enabled: true,
+        ewmh: crate::x11::supports_ewmh(&crate::x11::DisplayTarget {
+            display: Some(session.display.clone()),
+            cookie: session.cookie_bytes().ok(),
+        }),
         screencast_portal: false,
         remote_desktop_portal: false,
         screenshot_portal: false,
@@ -101,6 +110,19 @@ pub fn detect_for(session: &desktop_core::agent::AgentSession) -> BackendInfo {
         DesktopEnvironment::Unknown,
         facts,
     )
+}
+
+/// Whether a window manager is running on the X display and publishes a window
+/// list.
+///
+/// Only consulted for X11 sessions. It is probed unconditionally anyway,
+/// because a Wayland session has `DISPLAY` set too and the answer there —
+/// mutter does manage XWayland's root window — is a fact about XWayland rather
+/// than about the session, which selection ignores by never asking under
+/// Wayland.
+fn probe_ewmh() -> bool {
+    env::var_os("DISPLAY").is_some()
+        && crate::x11::supports_ewmh(&crate::x11::DisplayTarget::host())
 }
 
 /// Whether a named accessibility bus answers.

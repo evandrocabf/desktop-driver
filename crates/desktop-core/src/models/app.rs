@@ -115,8 +115,23 @@ pub struct Window {
     pub bounds: Option<Bounds>,
     pub focused: bool,
     pub minimized: bool,
+    /// Whether this window has an accessibility tree behind it.
+    ///
+    /// `false` is the window manager reporting a window whose application
+    /// exposes nothing on AT-SPI — visible on screen, clickable by coordinate,
+    /// and impossible to snapshot or address by element. Listing it and saying
+    /// so beats both alternatives: omitting it hides a window the user can see,
+    /// and listing it silently invites an agent to snapshot it and read the
+    /// failure as a broken tool.
+    #[serde(default = "yes")]
+    pub accessible: bool,
     /// Ordinal among the owning application's windows, used by [`WindowKey`].
     pub index: u16,
+}
+
+/// The default for [`Window::accessible`] when a stored document predates it.
+const fn yes() -> bool {
+    true
 }
 
 impl Window {
@@ -162,9 +177,28 @@ mod tests {
             bounds: None,
             focused: true,
             minimized: false,
+            accessible: true,
             index: 0,
         };
         let value = serde_json::to_value(&window).expect("serializes");
         assert!(value["bounds"].is_null());
+    }
+
+    /// Every window the previous version could list had a tree, since AT-SPI
+    /// frames were the only source. Defaulting to false would retroactively
+    /// mark all of them unreadable.
+    #[test]
+    fn a_window_from_a_document_written_before_accessible_existed_reads_as_accessible() {
+        let window: Window = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "title": "main.rs",
+            "app": { "pid": 4242, "name": "Visual Studio Code" },
+            "bounds": null,
+            "focused": true,
+            "minimized": false,
+            "index": 0
+        }))
+        .expect("deserializes");
+        assert!(window.accessible);
     }
 }

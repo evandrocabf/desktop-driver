@@ -249,7 +249,7 @@ mod tests {
             desktop_environment: DesktopEnvironment::Gnome,
             accessibility: Backend::AtSpi,
             windows: Backend::AtSpi,
-            screenshot: Backend::PortalScreenCast,
+            screenshot: Backend::XdgDesktopPortal,
             input: Backend::RemoteDesktopPortal,
         }
     }

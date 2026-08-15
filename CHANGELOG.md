@@ -20,8 +20,19 @@ the binary and links the agent skill into whichever coding agents are present.
   through the accessibility API rather than synthetic input, so it needs no pointer, no focus change
   and no coordinates. `desktop type --element N` writes into a field directly, and verifies the
   write landed rather than trusting the toolkit's return value.
-- **Screenshots**, through `GetImage` under X11, the Screenshot and ScreenCast portals under GNOME
-  Wayland, and `SCScreenshotManager` on macOS.
+- **Screenshots**, through `GetImage` under X11, the Screenshot portal under Wayland, and
+  `SCScreenshotManager` on macOS.
+- **Window lists from the window manager under X11.** EWMH supplies the windows, their stacking
+  order (topmost first), their real screen geometry and the minimized state, with AT-SPI joined onto
+  it for the tree behind each. An application with no accessibility support is listed rather than
+  invisible, marked `"accessible": false`: it can be screenshotted and clicked by coordinate, and
+  `desktop snapshot` on it refuses instead of inventing an empty tree. Under Wayland the list still
+  comes from AT-SPI frames, which is all a client there can see.
+- **Installation in one line** — `curl -fsSL .../install.sh | bash`, needing only curl and tar. The
+  source arrives as a tarball where git is absent, and the binary is downloaded from the matching
+  release and verified against its published SHA-256, falling back to a source build where no
+  release covers the platform. Releases are built for x86_64 and aarch64 Linux (static musl) and
+  both macOS architectures by `.github/workflows/release.yml` on a `v*` tag.
 - **`desktop session`** — a display of the agent's own: its own X server, D-Bus, accessibility bus
   and window manager, plus its own home directory so a browser opens a clean profile instead of
   yours and the two do not contend for one profile lock. Inside a session nothing is shared, so
@@ -52,5 +63,11 @@ the binary and links the agent skill into whichever coding agents are present.
   platform traps are handled, but **it has not been run on hardware**. Treat it as unverified.
 - Linux is verified end to end on Fedora, Debian, Ubuntu, Arch and openSUSE by
   `scripts/distro-matrix.sh`.
-- KDE, wlroots and other non-GNOME Wayland compositors are detected and refused with a structured
-  error rather than driven through an unverified path. `desktop session` works there today.
+- Backends are selected from what a session advertises rather than from its name, so KDE, wlroots
+  and other non-GNOME Wayland compositors get the freedesktop portals their own desktop implements.
+  Only GNOME's portal backend has been run against, and every capability note away from GNOME says
+  so. Where a portal is genuinely absent the refusal is still a structured error rather than an
+  unverified path, and `desktop session` works there regardless.
+- Input under Wayland needs both the RemoteDesktop and ScreenCast portals, because absolute pointer
+  positioning interprets its coordinates in a screencast stream's space. A session offering only one
+  of the two reports no input backend instead of failing on its first click.

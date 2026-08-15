@@ -3,7 +3,7 @@
 use desktop_core::{
     errors::{Permission, PermissionState},
     models::{
-        backend::{Backend, BackendInfo, DisplayServer, SessionFacts},
+        backend::{Backend, BackendInfo, DesktopEnvironment, DisplayServer, SessionFacts},
         capability::{Capability, CapabilitySet, CapabilityState, UnsupportedReason},
     },
     ports::{Diagnostic, PlatformProbe},
@@ -108,11 +108,14 @@ impl PlatformProbe for LinuxProbe {
 /// is a no-op rather than a best effort.
 ///
 /// **Screenshots** stop warning about the approval dialog once the desktop has
-/// recorded the grant, since saying so then would be stale advice.
+/// recorded the grant, since saying so then would be stale advice. Away from
+/// GNOME they carry the caveat that the portal backend is untested here.
 ///
-/// **Window screenshots** through the ScreenCast portal are degraded because it
-/// shows a picker and offers no way to name the window programmatically: it
-/// works, but a human chooses.
+/// **Window screenshots** are unavailable under Wayland. The Screenshot portal
+/// has no window target that any backend implements, and the ScreenCast route
+/// needs a human to pick the window in a dialog. This reported "degraded" on
+/// the strength of that dialog while the capture path refused every window
+/// outright — a caveat describing a route the code never took.
 #[must_use]
 pub fn capabilities_for(info: &BackendInfo) -> CapabilitySet {
     capabilities_from(info, &crate::session::missing_requirements())
@@ -131,6 +134,24 @@ pub fn capabilities_for(info: &BackendInfo) -> CapabilitySet {
 ///
 /// Taking it as an argument keeps the mapping pure and leaves
 /// [`capabilities_for`] as the one place that looks at the host.
+/// The caveat a portal-backed capability carries away from GNOME.
+///
+/// The interfaces are freedesktop's and every backend implements the same ones,
+/// which is why they are now selected wherever they are advertised rather than
+/// on GNOME alone. What is *not* the same everywhere is how each backend
+/// behaves in practice, and only GNOME's has been run against. Saying so is the
+/// difference between an untested path and an unclaimed one.
+fn unverified_portal_backend(info: &BackendInfo) -> Option<String> {
+    match info.desktop_environment {
+        DesktopEnvironment::Gnome => None,
+        other => Some(format!(
+            "this build has been verified against GNOME's portal backend and not {}'s, so \
+             treat it as untested here; `desktop session` needs no portal at all",
+            other.as_str()
+        )),
+    }
+}
+
 #[must_use]
 pub fn capabilities_from(info: &BackendInfo, missing_session_helpers: &[&str]) -> CapabilitySet {
     let mut set = CapabilitySet::new();
@@ -184,14 +205,21 @@ pub fn capabilities_from(info: &BackendInfo, missing_session_helpers: &[&str]) -
         Capability::Screenshots,
         match info.screenshot {
             Backend::X11 => CapabilityState::Supported,
-            Backend::PortalScreenCast | Backend::XdgDesktopPortal => {
-                if crate::portal::screenshot_permission_granted() {
-                    CapabilityState::Supported
-                } else {
-                    CapabilityState::degraded(
+            Backend::XdgDesktopPortal => {
+                let mut note = String::new();
+                if !crate::portal::screenshot_permission_granted() {
+                    note.push_str(
                         "the first capture needs a one-time approval dialog; \
                          run `desktop setup` to get it over with",
-                    )
+                    );
+                }
+                match (note.is_empty(), unverified_portal_backend(info)) {
+                    (true, None) => CapabilityState::Supported,
+                    (true, Some(caveat)) => CapabilityState::degraded(&caveat),
+                    (false, None) => CapabilityState::degraded(&note),
+                    (false, Some(caveat)) => {
+                        CapabilityState::degraded(&format!("{note}. {caveat}"))
+                    }
                 }
             }
             _ => CapabilityState::unsupported(UnsupportedReason::NoBackendMechanism),
@@ -202,13 +230,6 @@ pub fn capabilities_from(info: &BackendInfo, missing_session_helpers: &[&str]) -
         Capability::WindowScreenshots,
         match info.screenshot {
             Backend::X11 => CapabilityState::Supported,
-            Backend::PortalScreenCast => CapabilityState::degraded(
-                "the portal shows a window picker; the specific window cannot be chosen \
-                 programmatically, and the choice is remembered by restore token",
-            ),
-            Backend::XdgDesktopPortal => {
-                CapabilityState::unsupported(UnsupportedReason::NoBackendMechanism)
-            }
             _ => CapabilityState::unsupported(UnsupportedReason::NoBackendMechanism),
         },
     );
@@ -226,9 +247,13 @@ pub fn capabilities_from(info: &BackendInfo, missing_session_helpers: &[&str]) -
 
     let input_state = match info.input {
         Backend::X11 => CapabilityState::Supported,
-        Backend::RemoteDesktopPortal => CapabilityState::degraded(
-            "input goes through the RemoteDesktop portal; the first use needs approval",
-        ),
+        Backend::RemoteDesktopPortal => {
+            let base = "input goes through the RemoteDesktop portal; the first use needs approval";
+            match unverified_portal_backend(info) {
+                None => CapabilityState::degraded(base),
+                Some(caveat) => CapabilityState::degraded(&format!("{base}. {caveat}")),
+            }
+        }
         _ => CapabilityState::unsupported(UnsupportedReason::NoBackendMechanism),
     };
     for capability in [Capability::Mouse, Capability::Keyboard, Capability::Scroll] {
@@ -240,11 +265,11 @@ pub fn capabilities_from(info: &BackendInfo, missing_session_helpers: &[&str]) -
 
 /// The advice `desktop doctor` prints, most severe first.
 ///
-/// Where a portal interface is advertised but not selected, the remedy says so.
-/// "There is no mechanism" and "the mechanism is there and this build has not
-/// been verified against it" call for different next steps, and collapsing them
-/// into one message sends a KDE user looking for a protocol that already exists
-/// on their machine.
+/// Absolute pointer positioning needs both the RemoteDesktop and the ScreenCast
+/// portal, because the coordinates are interpreted in a screencast stream's
+/// space. The remedy names whichever half is actually missing: installing a
+/// portal backend and enabling a disabled interface are different jobs, and
+/// collapsing them into one message sends a user looking for the wrong thing.
 #[must_use]
 pub fn diagnostics_for(info: &BackendInfo, facts: SessionFacts) -> Vec<Diagnostic> {
     let mut out = Vec::new();
@@ -263,14 +288,16 @@ pub fn diagnostics_for(info: &BackendInfo, facts: SessionFacts) -> Vec<Diagnosti
         ));
 
         if info.input == Backend::None {
-            let remedy = if facts.remote_desktop_portal {
-                format!(
-                    "Your desktop does advertise org.freedesktop.portal.RemoteDesktop, so                      the mechanism exists — this build only selects it on GNOME, where it                      has been verified. Driving {} through it is untested rather than                      impossible; an agent display (`desktop session`) works here today and                      does not depend on the portal at all.",
-                    info.desktop_environment.as_str()
-                )
-            } else {
-                "This build drives input only through the RemoteDesktop portal, and your                  session does not provide it. KDE and wlroots have working mechanisms                  upstream that desktop-driver does not implement yet. `desktop session`                  gives the agent an X11 display where input works regardless."
-                    .to_owned()
+            let remedy = match (facts.remote_desktop_portal, facts.screencast_portal) {
+                (true, false) => {
+                    "Your desktop advertises org.freedesktop.portal.RemoteDesktop but not                      ScreenCast, and absolute pointer positioning needs both — the                      coordinates are interpreted in a screencast stream's space. Install                      the ScreenCast half of your portal backend (on wlroots that is                      xdg-desktop-portal-wlr), or use `desktop session`, which needs no                      portal at all."
+                }
+                (false, _) => {
+                    "This build drives input through the RemoteDesktop portal, and your                      session does not provide it. `desktop session` gives the agent an X11                      display where input works regardless."
+                }
+                (true, true) => {
+                    "Both portals are advertised, so this is unexpected — run `desktop info`                      and report what it prints."
+                }
             };
             out.push(Diagnostic::error(
                 format!(
@@ -281,14 +308,27 @@ pub fn diagnostics_for(info: &BackendInfo, facts: SessionFacts) -> Vec<Diagnosti
             ));
         }
 
-        if info.screenshot == Backend::None && facts.screenshot_portal {
+        if info.screenshot == Backend::None {
             out.push(Diagnostic::warning(
                 format!(
-                    "Screen capture is unavailable on {} Wayland, though your desktop does                      advertise the Screenshot portal.",
+                    "Screen capture is unavailable on {} Wayland: nothing on the session bus \
+                     answers org.freedesktop.portal.Screenshot.",
                     info.desktop_environment.as_str()
                 ),
-                "This build selects the portal only on GNOME, where it has been verified.                  `desktop session` gives the agent an X11 display that captures natively.",
+                "Install xdg-desktop-portal plus the backend for your desktop                  (xdg-desktop-portal-gnome, -kde or -wlr). `desktop session` gives the agent                  an X11 display that captures natively without one.",
             ));
+        }
+
+        if info.desktop_environment != DesktopEnvironment::Gnome
+            && (info.input == Backend::RemoteDesktopPortal
+                || info.screenshot == Backend::XdgDesktopPortal)
+        {
+            out.push(Diagnostic::info(format!(
+                "Capture and input here use the freedesktop portals your desktop advertises, \
+                 but this build has only been verified against GNOME's backend — treat {} as \
+                 untested and check the result of the first click.",
+                info.desktop_environment.as_str()
+            )));
         }
 
         if facts.x11_display {
@@ -358,7 +398,17 @@ mod tests {
             DisplayServer::Wayland,
             DesktopEnvironment::Gnome,
             Backend::AtSpi,
-            Backend::PortalScreenCast,
+            Backend::XdgDesktopPortal,
+            Backend::RemoteDesktopPortal,
+        )
+    }
+
+    fn kde_wayland_with_portals() -> BackendInfo {
+        info(
+            DisplayServer::Wayland,
+            DesktopEnvironment::Kde,
+            Backend::AtSpi,
+            Backend::XdgDesktopPortal,
             Backend::RemoteDesktopPortal,
         )
     }
@@ -408,16 +458,41 @@ mod tests {
         }
     }
 
+    /// This reported "degraded — the portal shows a window picker" while
+    /// `PortalCapture` returned `unsupported_capability` for every window, so
+    /// `desktop capabilities` promised a route the code never took.
     #[test]
-    fn gnome_wayland_window_capture_is_degraded_rather_than_supported() {
-        // The portal picker means a human chooses the window on first use.
-        // Calling that "supported" would mislead an agent into a hang.
+    fn window_capture_under_wayland_is_refused_because_the_capture_path_refuses_it() {
         let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED);
-        assert!(matches!(
-            caps.get(Capability::WindowScreenshots),
-            CapabilityState::Degraded { .. }
-        ));
-        assert!(caps.is_available(Capability::WindowScreenshots));
+        assert!(!caps.is_available(Capability::WindowScreenshots));
+    }
+
+    /// The interface is freedesktop's and is selected wherever it is
+    /// advertised; the caveat is about which backend has actually been run
+    /// against, which is a different question and belongs in the note.
+    #[test]
+    fn a_portal_capability_away_from_gnome_says_it_is_untested_there() {
+        let caps = capabilities_from(&kde_wayland_with_portals(), &HELPERS_INSTALLED);
+        for capability in [Capability::Mouse, Capability::Screenshots] {
+            match caps.get(capability) {
+                CapabilityState::Degraded { note } => {
+                    assert!(note.contains("kde"), "{capability:?} note was {note}");
+                }
+                other => panic!("expected {capability:?} degraded, got {other:?}"),
+            }
+            assert!(caps.is_available(capability), "{capability:?}");
+        }
+    }
+
+    #[test]
+    fn the_same_capability_on_gnome_carries_no_untested_caveat() {
+        let caps = capabilities_from(&gnome_wayland(), &HELPERS_INSTALLED);
+        match caps.get(Capability::Mouse) {
+            CapabilityState::Degraded { note } => {
+                assert!(!note.contains("untested"), "got {note}");
+            }
+            other => panic!("expected degraded, got {other:?}"),
+        }
     }
 
     #[test]

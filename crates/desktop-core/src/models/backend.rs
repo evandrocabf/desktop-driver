@@ -125,8 +125,6 @@ pub enum Backend {
 
     X11,
     XdgDesktopPortal,
-    #[serde(rename = "portal-screencast")]
-    PortalScreenCast,
     RemoteDesktopPortal,
     ScreenCaptureKit,
     CoreGraphics,
@@ -142,7 +140,6 @@ impl Backend {
             Self::AxUiElement => "ax-ui-element",
             Self::X11 => "x11",
             Self::XdgDesktopPortal => "xdg-desktop-portal",
-            Self::PortalScreenCast => "portal-screencast",
             Self::RemoteDesktopPortal => "remote-desktop-portal",
             Self::ScreenCaptureKit => "screen-capture-kit",
             Self::CoreGraphics => "core-graphics",
@@ -164,6 +161,13 @@ pub struct SessionFacts {
     /// reachable while this is off, in which case lazy toolkits (Firefox,
     /// Chromium, Qt) expose a window with an empty tree.
     pub atspi_enabled: bool,
+    /// A window manager is running and publishes `_NET_CLIENT_LIST_STACKING`.
+    ///
+    /// Distinct from `x11_display`, and the distinction is load-bearing: a bare
+    /// `Xvfb` with no window manager answers every X11 call and reports no
+    /// windows whatsoever, which would read as "window listing works, and you
+    /// have none open" rather than as "nothing here manages windows".
+    pub ewmh: bool,
     pub screencast_portal: bool,
     pub remote_desktop_portal: bool,
     pub screenshot_portal: bool,
@@ -200,13 +204,27 @@ pub fn select_display_server(facts: SessionFacts) -> DisplayServer {
 
 /// Chooses the four Linux mechanisms.
 ///
-/// KDE and wlroots deliberately land on [`Backend::None`] for capture and
-/// input: the mechanisms exist upstream but are not implemented here, and a
-/// wrong-but-plausible fallback is worse than an honest refusal.
+/// Every choice is made from what the session *advertises*, never from its
+/// name. An earlier version gated the portals on GNOME, which left KDE and
+/// wlroots refusing mechanisms their own desktop implements — the freedesktop
+/// portal interfaces are not GNOME's, and a probe already establishes whether
+/// each one is present. What the desktop environment still decides is the
+/// wording of a capability note: GNOME's portal backend is the one this build
+/// has been verified against, and the rest say so.
 ///
-/// The window *list* is attributed to AT-SPI on every Linux session, X11
-/// included: EWMH raises a window, it does not enumerate one, so naming it here
-/// would credit a mechanism that produced none of the output.
+/// Input requires *two* portals rather than one. Absolute pointer positioning
+/// interprets its coordinates in a PipeWire stream's logical space, so the
+/// RemoteDesktop session has to carry a ScreenCast source as well; without one
+/// the only thing left is relative motion from wherever the pointer happens to
+/// be, which is not a position anybody knows. `xdg-desktop-portal-wlr` offers
+/// ScreenCast alone, and this is what makes that come out as "no input" rather
+/// than as a session that fails on its first click.
+///
+/// The window *list* comes from EWMH wherever a window manager publishes
+/// `_NET_CLIENT_LIST_STACKING`, and falls back to AT-SPI frames where none
+/// does. That is the difference between a list carrying stacking order, screen
+/// geometry and every managed window, and one that silently omits any
+/// application without accessibility support.
 #[must_use]
 pub fn select_linux_backends(
     display_server: DisplayServer,
@@ -219,27 +237,30 @@ pub fn select_linux_backends(
         Backend::None
     };
 
-    let windows = if facts.a11y_bus {
+    let frames = if facts.a11y_bus {
         Backend::AtSpi
     } else {
         Backend::None
     };
 
     let (windows, screenshot, input) = match display_server {
-        DisplayServer::X11 => (windows, Backend::X11, Backend::X11),
+        DisplayServer::X11 => (
+            if facts.ewmh { Backend::Ewmh } else { frames },
+            Backend::X11,
+            Backend::X11,
+        ),
         DisplayServer::Wayland => {
-            let screenshot = match desktop {
-                DesktopEnvironment::Gnome if facts.screencast_portal => Backend::PortalScreenCast,
-                DesktopEnvironment::Gnome if facts.screenshot_portal => Backend::XdgDesktopPortal,
-                _ => Backend::None,
+            let screenshot = if facts.screenshot_portal {
+                Backend::XdgDesktopPortal
+            } else {
+                Backend::None
             };
-            let input = match desktop {
-                DesktopEnvironment::Gnome if facts.remote_desktop_portal => {
-                    Backend::RemoteDesktopPortal
-                }
-                _ => Backend::None,
+            let input = if facts.remote_desktop_portal && facts.screencast_portal {
+                Backend::RemoteDesktopPortal
+            } else {
+                Backend::None
             };
-            (windows, screenshot, input)
+            (frames, screenshot, input)
         }
         DisplayServer::Headless | DisplayServer::Quartz => {
             (Backend::None, Backend::None, Backend::None)
@@ -261,15 +282,18 @@ pub fn select_linux_backends(
 mod tests {
     use super::*;
 
+    /// `x11_display` is set because XWayland is running, which is the trap this
+    /// module exists to avoid. `ewmh` is false because nothing on that X
+    /// display manages windows; the compositor does.
     fn gnome_wayland() -> SessionFacts {
         SessionFacts {
             wayland_display: true,
-            // XWayland is running, so DISPLAY is set too. This is the trap.
             x11_display: true,
             session_type_wayland: true,
             session_type_x11: false,
             a11y_bus: true,
             atspi_enabled: true,
+            ewmh: false,
             screencast_portal: true,
             remote_desktop_portal: true,
             screenshot_portal: true,
@@ -284,6 +308,7 @@ mod tests {
             session_type_x11: true,
             a11y_bus: true,
             atspi_enabled: true,
+            ewmh: true,
             screencast_portal: false,
             remote_desktop_portal: false,
             screenshot_portal: false,
@@ -334,7 +359,7 @@ mod tests {
         );
         assert_eq!(info.accessibility, Backend::AtSpi);
         assert_eq!(info.windows, Backend::AtSpi);
-        assert_eq!(info.screenshot, Backend::PortalScreenCast);
+        assert_eq!(info.screenshot, Backend::XdgDesktopPortal);
         assert_eq!(info.input, Backend::RemoteDesktopPortal);
     }
 
@@ -347,41 +372,91 @@ mod tests {
         assert_eq!(info.input, Backend::X11);
     }
 
+    /// EWMH enumerates and positions windows where a window manager publishes
+    /// the properties; AT-SPI frames are the fallback. Naming either where the
+    /// other did the work would credit a mechanism that generated none of the
+    /// output.
     #[test]
-    fn the_window_list_is_attributed_to_at_spi_on_every_display_server() {
-        // EWMH raises windows; it is not what produces the list. Naming it
-        // here would credit a mechanism that generated none of the output.
-        for (server, facts) in [
-            (DisplayServer::X11, plain_x11()),
-            (DisplayServer::Wayland, gnome_wayland()),
+    fn the_window_list_is_credited_to_whichever_mechanism_produced_it() {
+        let x11 = select_linux_backends(DisplayServer::X11, DesktopEnvironment::Xfce, plain_x11());
+        assert_eq!(x11.windows, Backend::Ewmh);
+
+        let wayland = select_linux_backends(
+            DisplayServer::Wayland,
+            DesktopEnvironment::Gnome,
+            gnome_wayland(),
+        );
+        assert_eq!(wayland.windows, Backend::AtSpi);
+    }
+
+    /// A bare Xvfb answers every X11 call and reports no windows at all.
+    /// Selecting EWMH there would turn "nothing manages windows here" into "you
+    /// have no windows open".
+    #[test]
+    fn an_x11_display_with_no_window_manager_falls_back_to_at_spi_frames() {
+        let facts = SessionFacts {
+            ewmh: false,
+            ..plain_x11()
+        };
+        let info = select_linux_backends(DisplayServer::X11, DesktopEnvironment::Unknown, facts);
+        assert_eq!(info.windows, Backend::AtSpi);
+    }
+
+    /// KDE's portal backend implements the same freedesktop interfaces GNOME's
+    /// does. Refusing them because `XDG_CURRENT_DESKTOP` said "KDE" withheld a
+    /// mechanism the machine was already running.
+    #[test]
+    fn a_desktop_is_given_the_portals_it_advertises_rather_than_the_ones_its_name_implies() {
+        for desktop in [
+            DesktopEnvironment::Kde,
+            DesktopEnvironment::Sway,
+            DesktopEnvironment::Unknown,
         ] {
-            let info = select_linux_backends(server, DesktopEnvironment::Gnome, facts);
-            assert_eq!(info.windows, Backend::AtSpi, "{server:?}");
+            let info = select_linux_backends(DisplayServer::Wayland, desktop, gnome_wayland());
+            assert_eq!(info.screenshot, Backend::XdgDesktopPortal, "{desktop:?}");
+            assert_eq!(info.input, Backend::RemoteDesktopPortal, "{desktop:?}");
         }
     }
 
     #[test]
-    fn kde_wayland_gets_accessibility_but_refuses_capture_and_input() {
-        // AT-SPI is display-server independent, so reading the tree still
-        // works. Capture and input are not implemented and must say so.
-        let info = select_linux_backends(
-            DisplayServer::Wayland,
-            DesktopEnvironment::Kde,
-            gnome_wayland(),
-        );
-        assert_eq!(info.accessibility, Backend::AtSpi);
+    fn a_wayland_session_with_no_portal_at_all_still_refuses_both() {
+        let facts = SessionFacts {
+            screencast_portal: false,
+            remote_desktop_portal: false,
+            screenshot_portal: false,
+            ..gnome_wayland()
+        };
+        let info =
+            select_linux_backends(DisplayServer::Wayland, DesktopEnvironment::Wlroots, facts);
+        assert_eq!(info.accessibility, Backend::AtSpi, "the tree is unaffected");
         assert_eq!(info.screenshot, Backend::None);
         assert_eq!(info.input, Backend::None);
     }
 
+    /// `xdg-desktop-portal-wlr` offers ScreenCast and no RemoteDesktop, so
+    /// there is nothing to send a key through.
     #[test]
-    fn an_unknown_wayland_compositor_refuses_capture_and_input() {
-        let info = select_linux_backends(
-            DisplayServer::Wayland,
-            DesktopEnvironment::Unknown,
-            gnome_wayland(),
-        );
-        assert_eq!(info.screenshot, Backend::None);
+    fn screencast_alone_is_not_enough_for_input() {
+        let facts = SessionFacts {
+            remote_desktop_portal: false,
+            ..gnome_wayland()
+        };
+        let info =
+            select_linux_backends(DisplayServer::Wayland, DesktopEnvironment::Wlroots, facts);
+        assert_eq!(info.screenshot, Backend::XdgDesktopPortal);
+        assert_eq!(info.input, Backend::None);
+    }
+
+    /// Absolute pointer motion is interpreted in a ScreenCast stream's space; a
+    /// RemoteDesktop session without one can only move the pointer relative to
+    /// wherever it already is.
+    #[test]
+    fn remote_desktop_alone_is_not_enough_for_input_either() {
+        let facts = SessionFacts {
+            screencast_portal: false,
+            ..gnome_wayland()
+        };
+        let info = select_linux_backends(DisplayServer::Wayland, DesktopEnvironment::Kde, facts);
         assert_eq!(info.input, Backend::None);
     }
 
@@ -396,14 +471,17 @@ mod tests {
         assert_eq!(info.windows, Backend::None);
     }
 
+    /// The capture path asks Screenshot for a file. A session advertising
+    /// ScreenCast but not Screenshot has nothing this build can call, and
+    /// saying otherwise would promise pixels it cannot fetch.
     #[test]
-    fn gnome_falls_back_to_the_screenshot_portal_when_screencast_is_absent() {
+    fn capture_follows_the_screenshot_portal_because_that_is_what_it_calls() {
         let facts = SessionFacts {
-            screencast_portal: false,
+            screenshot_portal: false,
             ..gnome_wayland()
         };
         let info = select_linux_backends(DisplayServer::Wayland, DesktopEnvironment::Gnome, facts);
-        assert_eq!(info.screenshot, Backend::XdgDesktopPortal);
+        assert_eq!(info.screenshot, Backend::None);
     }
 
     #[test]
@@ -440,7 +518,7 @@ mod tests {
         assert_eq!(json["display_server"], "wayland");
         assert_eq!(json["desktop_environment"], "gnome");
         assert_eq!(json["accessibility"], "at-spi");
-        assert_eq!(json["screenshot"], "portal-screencast");
+        assert_eq!(json["screenshot"], "xdg-desktop-portal");
         assert_eq!(json["input"], "remote-desktop-portal");
     }
 }
