@@ -245,6 +245,11 @@ impl AccessibilityPort for Accessibility {
     /// The windows of one application, or of all of them.
     ///
     /// Bounds are real screen coordinates here, unlike under Wayland.
+    ///
+    /// Every window is reported as accessible because the list comes from the
+    /// accessibility API itself, so anything in it necessarily has a tree. The
+    /// field exists for Linux, where the window manager sees windows AT-SPI
+    /// does not.
     fn list_windows(&self, app: Option<&AppKey>) -> Result<Vec<Window>> {
         let mut out = Vec::new();
         let mut next_id = 0u32;
@@ -262,6 +267,7 @@ impl AccessibilityPort for Accessibility {
                     bounds: window.bounds(),
                     focused: window.boolean(attribute::FOCUSED).unwrap_or(false),
                     minimized: window.boolean(attribute::MINIMIZED).unwrap_or(false),
+                    accessible: true,
                     index: u16::try_from(index).unwrap_or(u16::MAX),
                 });
                 next_id += 1;
@@ -288,6 +294,7 @@ impl AccessibilityPort for Accessibility {
                 bounds: window.bounds(),
                 focused: true,
                 minimized: false,
+                accessible: true,
                 index: u16::try_from(index).unwrap_or(0),
             },
             root,

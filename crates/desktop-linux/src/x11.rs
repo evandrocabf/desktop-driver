@@ -11,7 +11,8 @@ use desktop_core::{
     models::{
         backend::Backend,
         chord::{Chord, Key, NamedKey},
-        geometry::{CoordinateSpace, Point, ScaleFactor, ScrollDelta},
+        geometry::{Bounds, CoordinateSpace, Point, ScaleFactor, ScrollDelta},
+        ids::WindowId,
         image::Image,
     },
     ports::{CapturePort, CaptureTarget, InputPort, KEYSTROKE_INTERVAL, MouseButton},
@@ -107,17 +108,52 @@ fn connect(target: &DisplayTarget) -> Result<(RustConnection, usize)> {
     Ok((connection, 0))
 }
 
-/// Raising a window and giving it the keyboard.
+/// What the window manager knows: which windows exist, and which one is active.
 ///
-/// A seam rather than a direct call because only X11 can do it: Wayland has no
-/// client-initiated raise, so under a Wayland session there is nothing to
+/// A seam rather than a direct call because only X11 can answer either
+/// question. Wayland has no client-initiated raise and no way to enumerate
+/// another client's surfaces, so under a Wayland session there is nothing to
 /// implement and the refusal has to reach the caller intact.
-pub trait WindowActivator: Send + Sync {
+pub trait WindowSource: Send + Sync {
     /// Activates the window matching `pid` and `title`.
     ///
     /// `Ok(false)` means no window matched — distinct from an error, because
     /// the caller can still try the accessibility route.
     fn activate(&self, pid: Option<u32>, title: Option<&str>) -> Result<bool>;
+
+    /// Every managed application window, topmost first.
+    ///
+    /// The order is the contract, not a detail: a `WindowId` is a position in
+    /// this list, and capture resolves one back to an `XID` by recomputing the
+    /// list in a *different process*. Two callers that ordered it differently
+    /// would screenshot a different window than the one they listed.
+    fn toplevels(&self) -> Result<Vec<ManagedWindow>>;
+}
+
+/// A window as the window manager describes it.
+///
+/// The `XID` stays inside this crate. A `WindowId` is a position in
+/// [`WindowSource::toplevels`], deliberately: leaking the platform handle would
+/// make a snapshot taken under X11 look interchangeable with one taken under
+/// Wayland, where no such handle exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedWindow {
+    pub xid: u32,
+    /// From `_NET_WM_PID`. Absent for an application that does not publish it,
+    /// and for anything running on the other side of an X11 forward.
+    pub pid: Option<u32>,
+    pub title: Option<String>,
+    /// The class field of `WM_CLASS` — the closest thing X11 offers to an
+    /// application name for a window whose process exposes nothing else.
+    pub class: Option<String>,
+    /// The client rectangle in root coordinates, excluding the frame the window
+    /// manager draws around it. Client coordinates because that is the space
+    /// every other number in this tool uses: AT-SPI extents are measured there,
+    /// and a click computed against a frame rectangle would land off by the
+    /// height of the title bar.
+    pub bounds: Option<Bounds>,
+    pub minimized: bool,
+    pub focused: bool,
 }
 
 /// The EWMH properties a window manager publishes.
@@ -128,9 +164,17 @@ pub trait WindowActivator: Send + Sync {
 struct Atoms {
     active_window: u32,
     client_list: u32,
+    client_list_stacking: u32,
     wm_name: u32,
     wm_pid: u32,
     utf8_string: u32,
+    wm_state: u32,
+    wm_state_hidden: u32,
+    supported: u32,
+    supporting_wm_check: u32,
+    window_type: u32,
+    window_type_desktop: u32,
+    window_type_dock: u32,
 }
 
 impl Atoms {
@@ -139,9 +183,17 @@ impl Atoms {
         for name in [
             "_NET_ACTIVE_WINDOW",
             "_NET_CLIENT_LIST",
+            "_NET_CLIENT_LIST_STACKING",
             "_NET_WM_NAME",
             "_NET_WM_PID",
             "UTF8_STRING",
+            "_NET_WM_STATE",
+            "_NET_WM_STATE_HIDDEN",
+            "_NET_SUPPORTED",
+            "_NET_SUPPORTING_WM_CHECK",
+            "_NET_WM_WINDOW_TYPE",
+            "_NET_WM_WINDOW_TYPE_DESKTOP",
+            "_NET_WM_WINDOW_TYPE_DOCK",
         ] {
             cookies.push(
                 connection
@@ -163,9 +215,17 @@ impl Atoms {
         Ok(Self {
             active_window: atoms[0],
             client_list: atoms[1],
-            wm_name: atoms[2],
-            wm_pid: atoms[3],
-            utf8_string: atoms[4],
+            client_list_stacking: atoms[2],
+            wm_name: atoms[3],
+            wm_pid: atoms[4],
+            utf8_string: atoms[5],
+            wm_state: atoms[6],
+            wm_state_hidden: atoms[7],
+            supported: atoms[8],
+            supporting_wm_check: atoms[9],
+            window_type: atoms[10],
+            window_type_desktop: atoms[11],
+            window_type_dock: atoms[12],
         })
     }
 }
@@ -264,6 +324,161 @@ impl Ewmh {
         reply.value32()?.next()
     }
 
+    /// The managed windows in stacking order, bottom to top.
+    ///
+    /// Falls back to `_NET_CLIENT_LIST` where the stacking property is absent.
+    /// That list carries no depth order, which is why
+    /// [`window_manager_lists_windows`](Self::window_manager_lists_windows)
+    /// requires the stacking one before the EWMH backend is selected at all:
+    /// the fallback exists so activation keeps working on an old window
+    /// manager, not so enumeration can quietly lose the order it promised.
+    fn stacking_list(&self) -> Result<Vec<u32>> {
+        let root = self.root()?;
+        let stacked = self
+            .connection
+            .get_property(
+                false,
+                root,
+                self.atoms.client_list_stacking,
+                AtomEnum::WINDOW,
+                0,
+                u32::MAX,
+            )
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32().map(Iterator::collect::<Vec<u32>>))
+            .unwrap_or_default();
+
+        if stacked.is_empty() {
+            return self.client_list();
+        }
+        Ok(stacked)
+    }
+
+    /// Whether a window manager is running *and* publishes a window list.
+    ///
+    /// Both halves matter. A bare `Xvfb` has no window manager at all, and an
+    /// old one may announce itself without implementing
+    /// `_NET_CLIENT_LIST_STACKING`; in either case enumeration would report an
+    /// empty desktop rather than an absent mechanism.
+    fn window_manager_lists_windows(&self) -> bool {
+        let Ok(root) = self.root() else {
+            return false;
+        };
+        let manager_present = self
+            .connection
+            .get_property(
+                false,
+                root,
+                self.atoms.supporting_wm_check,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32()?.next())
+            .is_some();
+        if !manager_present {
+            return false;
+        }
+
+        self.connection
+            .get_property(
+                false,
+                root,
+                self.atoms.supported,
+                AtomEnum::ATOM,
+                0,
+                u32::MAX,
+            )
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32().map(Iterator::collect::<Vec<u32>>))
+            .is_some_and(|supported| supported.contains(&self.atoms.client_list_stacking))
+    }
+
+    /// The client rectangle in root coordinates.
+    ///
+    /// `GetGeometry` reports a size and a position relative to the *parent*,
+    /// which under a reparenting window manager is the frame rather than the
+    /// root — so the position is translated explicitly. Returning `None` for
+    /// the whole window means it disappeared between the listing and this call,
+    /// which is an ordinary race rather than a fault.
+    fn geometry(&self, window: u32) -> Option<(u16, u16, Option<Point>)> {
+        let geometry = self.connection.get_geometry(window).ok()?.reply().ok()?;
+        let root = self.root().ok()?;
+        let origin = self
+            .connection
+            .translate_coordinates(window, root, 0, 0)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| Point::new(i32::from(reply.dst_x), i32::from(reply.dst_y)));
+        Some((geometry.width, geometry.height, origin))
+    }
+
+    /// Whether `_NET_WM_STATE` carries `_NET_WM_STATE_HIDDEN`, which is what a
+    /// window manager sets when it iconifies a window.
+    fn is_hidden(&self, window: u32) -> bool {
+        self.connection
+            .get_property(
+                false,
+                window,
+                self.atoms.wm_state,
+                AtomEnum::ATOM,
+                0,
+                u32::MAX,
+            )
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32().map(Iterator::collect::<Vec<u32>>))
+            .is_some_and(|states| states.contains(&self.atoms.wm_state_hidden))
+    }
+
+    /// Whether this is an application window rather than desktop furniture.
+    ///
+    /// Panels and the wallpaper are managed windows and appear in the client
+    /// list; they are not what "the windows on this desktop" means to anyone
+    /// asking. A window with no `_NET_WM_WINDOW_TYPE` at all counts as an
+    /// application window, which is what the property's default says.
+    fn is_application_window(&self, window: u32) -> bool {
+        let types = self
+            .connection
+            .get_property(
+                false,
+                window,
+                self.atoms.window_type,
+                AtomEnum::ATOM,
+                0,
+                u32::MAX,
+            )
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32().map(Iterator::collect::<Vec<u32>>))
+            .unwrap_or_default();
+
+        !types.iter().any(|kind| {
+            *kind == self.atoms.window_type_desktop || *kind == self.atoms.window_type_dock
+        })
+    }
+
+    fn class(&self, window: u32) -> Option<String> {
+        let reply = self
+            .connection
+            .get_property(
+                false,
+                window,
+                u32::from(AtomEnum::WM_CLASS),
+                u32::from(AtomEnum::STRING),
+                0,
+                u32::MAX,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        class_from_wm_class(&reply.value)
+    }
+
     /// Asks the window manager to activate a window, the way a taskbar does.
     ///
     /// Source indication 2 ("pager") is what window managers honour without the
@@ -294,7 +509,42 @@ impl Ewmh {
     }
 }
 
-impl WindowActivator for Ewmh {
+impl WindowSource for Ewmh {
+    /// Every application window the window manager reports, topmost first.
+    ///
+    /// `_NET_CLIENT_LIST_STACKING` runs bottom to top, and is reversed here:
+    /// an agent asking "what is on screen" wants the window in front first,
+    /// and the ordering is what window ids are assigned from.
+    ///
+    /// A window that vanishes mid-walk is dropped rather than failing the call.
+    /// Enumerating a live desktop always races it, and one closed window is not
+    /// a reason to refuse the list.
+    fn toplevels(&self) -> Result<Vec<ManagedWindow>> {
+        let active = self.active_window();
+        let mut out = Vec::new();
+
+        for window in self.stacking_list()?.into_iter().rev() {
+            if !self.is_application_window(window) {
+                continue;
+            }
+            let Some((width, height, origin)) = self.geometry(window) else {
+                continue;
+            };
+            out.push(ManagedWindow {
+                xid: window,
+                pid: self.pid(window),
+                title: self.title(window),
+                class: self.class(window),
+                bounds: origin.map(|origin| {
+                    Bounds::new(origin.x, origin.y, i32::from(width), i32::from(height))
+                }),
+                minimized: self.is_hidden(window),
+                focused: active == Some(window),
+            });
+        }
+        Ok(out)
+    }
+
     /// Matches on pid first and title second.
     ///
     /// The pid is exact; the title is what is left when an application does not
@@ -334,18 +584,64 @@ impl WindowActivator for Ewmh {
     }
 }
 
+/// The application name out of a `WM_CLASS` property.
+///
+/// The property holds two NUL-terminated strings: the instance name first —
+/// which is the invocation, often lowercase and sometimes the binary path —
+/// then the class, which is what a taskbar shows. The class is preferred and
+/// the instance is the fallback, because a few applications set only one.
+fn class_from_wm_class(value: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(value);
+    let mut fields = text.split('\0').filter(|field| !field.is_empty());
+    let instance = fields.next()?.to_owned();
+    Some(fields.next().map_or(instance, str::to_owned))
+}
+
 /// How long a window manager gets to honour an activation request.
 const ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Whether this display has a window manager that can be enumerated.
+///
+/// Probed rather than assumed: `DISPLAY` being set says an X server answers,
+/// not that anything on it manages windows.
+#[must_use]
+pub fn supports_ewmh(target: &DisplayTarget) -> bool {
+    Ewmh::connect(target).is_ok_and(|ewmh| ewmh.window_manager_lists_windows())
+}
+
 pub struct X11Capture {
-    connection: RustConnection,
-    screen: usize,
+    /// Held for the window list rather than for activation: a `WindowId` names
+    /// a position in it, and this process has to resolve that back to an `XID`
+    /// on its own — the listing happened in an earlier one.
+    ewmh: Ewmh,
 }
 
 impl X11Capture {
     pub fn connect(target: &DisplayTarget) -> Result<Self> {
-        let (connection, screen) = connect(target)?;
-        Ok(Self { connection, screen })
+        Ok(Self {
+            ewmh: Ewmh::connect(target)?,
+        })
+    }
+
+    /// Resolves a window id to the drawable it names.
+    ///
+    /// The id is an index into [`WindowSource::toplevels`], recomputed here.
+    /// It was previously used as an `XID` directly, which read whichever
+    /// unrelated resource happened to hold that number — usually none, so
+    /// `desktop screenshot --window 2` failed on a window that was plainly
+    /// listed a moment earlier.
+    fn drawable_for(&self, id: WindowId) -> Result<u32> {
+        let windows = self.ewmh.toplevels()?;
+        windows
+            .get(id.get() as usize)
+            .map(|window| window.xid)
+            .ok_or_else(|| DesktopError::TargetNotFound {
+                target: format!(
+                    "window {id}: this display has {} window(s); run `desktop windows` for \
+                     current ids",
+                    windows.len()
+                ),
+            })
     }
 }
 
@@ -355,10 +651,11 @@ impl CapturePort for X11Capture {
     /// X11 can read any drawable, so a window is captured directly rather than
     /// cropped out of a full-screen grab.
     fn capture(&self, target: &CaptureTarget) -> Result<Image> {
-        let setup = self.connection.setup();
+        let connection = &self.ewmh.connection;
+        let setup = connection.setup();
         let screen = setup
             .roots
-            .get(self.screen)
+            .get(self.ewmh.screen)
             .ok_or_else(|| DesktopError::backend("X server reported no screens"))?;
 
         let (drawable, width, height, space) = match target {
@@ -369,9 +666,8 @@ impl CapturePort for X11Capture {
                 CoordinateSpace::primary_screen(),
             ),
             CaptureTarget::Window(id) => {
-                let window = id.get();
-                let geometry = self
-                    .connection
+                let window = self.drawable_for(*id)?;
+                let geometry = connection
                     .get_geometry(window)
                     .map_err(|error| DesktopError::backend(format!("bad window: {error}")))?
                     .reply()
@@ -385,8 +681,7 @@ impl CapturePort for X11Capture {
             }
         };
 
-        let reply = self
-            .connection
+        let reply = connection
             .get_image(
                 ImageFormat::Z_PIXMAP,
                 drawable,
@@ -785,6 +1080,32 @@ fn keysym_for_char(character: char) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pairs here are what xterm and gnome-calculator actually publish:
+    /// instance first, then class.
+    #[test]
+    fn wm_class_yields_the_class_rather_than_the_invocation() {
+        assert_eq!(
+            class_from_wm_class(b"xterm\0XTerm\0"),
+            Some("XTerm".to_owned())
+        );
+        assert_eq!(
+            class_from_wm_class(b"gnome-calculator\0Gnome-calculator\0"),
+            Some("Gnome-calculator".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_wm_class_with_only_one_field_falls_back_to_it() {
+        assert_eq!(class_from_wm_class(b"zenity\0"), Some("zenity".to_owned()));
+        assert_eq!(class_from_wm_class(b"zenity"), Some("zenity".to_owned()));
+    }
+
+    #[test]
+    fn an_absent_or_empty_wm_class_names_nothing_rather_than_an_empty_string() {
+        assert_eq!(class_from_wm_class(b""), None);
+        assert_eq!(class_from_wm_class(b"\0\0"), None);
+    }
 
     #[test]
     fn ascii_characters_map_to_their_own_keysym() {

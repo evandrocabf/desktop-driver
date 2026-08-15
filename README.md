@@ -203,17 +203,24 @@ available.
 | accessibility tree | ✓ | ✓ | ✓ | ✓ | ✓ |
 | element actions | ✓ | ✓ | ✓ | ✓ | ✓ |
 | applications | ✓ | ✓ | ~ | ~ | ✓ |
-| windows | ✓ | ~ | ~ | ~ | ~ |
-| screenshot (screen) | ✓ | ✓ | ~ | ✗ | ✓ |
+| windows | ✓ | ✓ | ~ | ~ | ✓ |
+| screenshot (screen) | ✓ | ✓ | ~ | ~ | ✓ |
 | screenshot (window) | ✓ | ✓ | ✗ | ✗ | ✓ |
-| mouse / keyboard / scroll | ✓ | ✓ | ~ | ✗ | ✓ |
+| mouse / keyboard / scroll | ✓ | ✓ | ~ | ~ | ✓ |
 | focus | ✓ | ✓ | ✗ | ✗ | ✓ |
 | agent session | ✗ | ✓ | ✓ | ✓ | — |
 
 The accessibility tree is the one row that is green everywhere, because AT-SPI
 is D-Bus and never talks to the compositor. That is also why it carries window
-enumeration on Wayland — and on X11, where EWMH is used to *raise* a window but
-not to list one, so `desktop info` reports `windows: at-spi` on both.
+enumeration on Wayland, where no protocol lets a client enumerate anything else.
+Under X11 the window manager knows more than AT-SPI does, so the list comes from
+EWMH and AT-SPI is joined onto it for the tree: `desktop info` reports `windows:
+ewmh` there and `windows: at-spi` under Wayland.
+
+The fourth column is `~` rather than `✗` because the portals are freedesktop's
+rather than GNOME's, and are now selected wherever a session advertises them.
+What that column does *not* have is verification: the caveat on every cell in it
+is that this build has only been run against GNOME's portal backend.
 
 The last column is the point of `desktop session`: an agent display is X11 that
 nobody else is using, so every row is green there regardless of what the user's
@@ -222,28 +229,38 @@ one window server per login and no supported way to make another.
 
 ### Why the caveats are caveats
 
-- **GNOME Wayland input** goes through the RemoteDesktop portal. The first use
-  shows an approval dialog; `desktop setup` gets it over with, and a stored
-  restore token means it does not come back.
-- **GNOME Wayland window list** comes from AT-SPI frames. No stacking order, no
-  screen position, and applications without accessibility support are invisible.
-- **GNOME Wayland window capture** is unavailable. The Screenshot portal has no
-  window target that any backend implements, and the ScreenCast route requires a
-  human to pick the window in a dialog. Capture the screen instead.
-- **Window lists** come from AT-SPI on every Linux session, so an application
-  without accessibility support is invisible and there is no stacking order.
-  Under X11 the geometry is real screen position; under Wayland it is not (see
-  below).
+- **Wayland input** goes through the RemoteDesktop portal. The first use shows an
+  approval dialog; `desktop setup` gets it over with, and a stored restore token
+  means it does not come back. It needs the ScreenCast portal too, because
+  absolute pointer positioning interprets its coordinates in a screencast
+  stream's space — a session offering only one of the two is reported as having
+  no input backend rather than failing on its first click.
+- **Wayland window lists** come from AT-SPI frames. No stacking order, no screen
+  position, and applications without accessibility support are invisible.
+- **Wayland window capture** is unavailable. The Screenshot portal has no window
+  target that any backend implements, and the ScreenCast route requires a human
+  to pick the window in a dialog. Capture the screen instead.
+- **Away from GNOME**, every portal-backed capability carries the same caveat:
+  the interface is advertised by the session and is therefore used, but only
+  GNOME's backend has actually been run against. `desktop capabilities` names the
+  desktop in the note rather than leaving it implied.
+- **X11 window lists** come from EWMH, so they carry stacking order (topmost
+  first), real screen geometry and the minimized state, and include applications
+  with no accessibility support at all. Those last ones are marked
+  `"accessible": false`: they can be screenshotted and clicked by coordinate, but
+  `desktop snapshot` on one refuses rather than inventing an empty tree.
 - **Focus under Wayland** is not merely unreliable, it is absent: there is no
   protocol for a client to raise a window. AT-SPI's `GrabFocus` returns success
   and does nothing, so the driver verifies the window actually became active and
   refuses when it did not. Under X11 focus goes through `_NET_ACTIVE_WINDOW`
   and the result is read back from the root window, so a window manager that
   declines is reported as a failure rather than as success.
-- **KDE and wlroots** have working mechanisms upstream — `org.kde.KWin.ScreenShot2`,
-  `wlr-screencopy`, `zwlr_virtual_pointer_v1` — that this build does not
-  implement. They are detected and refused with a structured error rather than
-  falling through to something that appears to work.
+- **KDE and wlroots** also have native mechanisms upstream —
+  `org.kde.KWin.ScreenShot2`, `wlr-screencopy`, `zwlr_virtual_pointer_v1` — that
+  this build does not implement. They would buy what the portals cannot give:
+  per-window capture, and on wlroots a real window raise. Until then those two
+  rows stay `✗` there, refused with a structured error rather than falling
+  through to something that appears to work.
 
 ### Two things that are not fixable here
 
@@ -370,7 +387,7 @@ gives you a single install command for your distribution. It is the answer to
 | `at-spi2-core` | **required** | reading the accessibility tree — snapshots, selectors, element actions |
 | `xdg-desktop-portal` + a backend | recommended (Wayland) | screenshots and input |
 | `Xvfb` | optional | `desktop session` — a display of the agent's own |
-| `openbox` | optional | window management inside that display, so focus works |
+| `openbox` | optional | window management inside that display: the window list, its stacking order and geometry, and focus |
 | `dbus-daemon` | optional | that display's private bus, which is what isolates its accessibility tree |
 
 The first two ship with any modern desktop, so a normal install needs nothing

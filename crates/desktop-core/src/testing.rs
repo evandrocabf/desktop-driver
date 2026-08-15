@@ -284,6 +284,7 @@ impl FakeState {
             bounds: self.root.bounds,
             focused: true,
             minimized: false,
+            accessible: true,
             index: 0,
         }
     }

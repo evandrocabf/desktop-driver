@@ -91,11 +91,11 @@ pub fn build_ports_for(scope: &Scope) -> Result<Ports> {
     let wiring = Wiring::for_scope(scope)?;
     let mut info = wiring.info;
 
-    let activator: Option<Box<dyn x11::WindowActivator>> =
+    let window_source: Option<Box<dyn x11::WindowSource>> =
         if info.display_server == DisplayServer::X11 {
             x11::Ewmh::connect(&wiring.display)
                 .ok()
-                .map(|ewmh| Box::new(ewmh) as Box<dyn x11::WindowActivator>)
+                .map(|ewmh| Box::new(ewmh) as Box<dyn x11::WindowSource>)
         } else {
             None
         };
@@ -106,7 +106,7 @@ pub fn build_ports_for(scope: &Scope) -> Result<Ports> {
             info.display_server == DisplayServer::Wayland,
             info.clone(),
         ) {
-            Ok(atspi) => Box::new(atspi.with_activator(activator)),
+            Ok(atspi) => Box::new(atspi.with_window_source(window_source)),
             Err(error) => {
                 tracing::debug!(%error, "accessibility unavailable; other ports continue");
                 info.accessibility = Backend::None;
@@ -117,9 +117,7 @@ pub fn build_ports_for(scope: &Scope) -> Result<Ports> {
 
     let capture: Box<dyn desktop_core::ports::CapturePort> = match info.screenshot {
         Backend::X11 => Box::new(x11::X11Capture::connect(&wiring.display)?),
-        Backend::PortalScreenCast | Backend::XdgDesktopPortal => {
-            Box::new(wayland::PortalCapture::new(info.clone()))
-        }
+        Backend::XdgDesktopPortal => Box::new(wayland::PortalCapture::new(info.clone())),
         _ => Box::new(unsupported::UnsupportedCapture::new(info.clone())),
     };
 
