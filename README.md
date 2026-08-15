@@ -282,12 +282,27 @@ architecture has slots for them but the GNOME path uses portals.
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/evandrocabf/desktop-driver/main/install.sh | bash
+```
+
+That needs `curl` and `tar` and nothing else. It takes the shortest route
+available on your machine and tells you which one it took: the source arrives as
+a tarball when `git` is missing and as a clone when it is not, and the binary is
+downloaded from the matching release — verified against its published SHA-256 —
+falling back to `cargo build` when this platform has no release or you asked for
+`--from-source`. A checksum that does not match is fatal rather than a reason to
+compile instead.
+
+From a checkout it always builds *that* checkout, which is what you want when
+you are working on it:
+
+```bash
 git clone https://github.com/evandrocabf/desktop-driver
 cd desktop-driver && ./install.sh
 ```
 
-`install.sh` builds the binary, puts it on your `PATH`, and links the agent
-skill into wherever your coding agents look for one. The skill itself is
+`install.sh` puts the binary on your `PATH` and links the agent skill into
+wherever your coding agents look for one. The skill itself is
 tool-agnostic — plain shell commands, no vendor's API — so every agent gets the
 same file. Codex, Claude Code, Cursor, opencode, Gemini/Antigravity, Cline and
 Windsurf are each detected and given it in their own layout, and
@@ -302,9 +317,16 @@ it added.
 ./install.sh --agents codex,cursor   # pick the agents yourself
 ./install.sh --all                   # every known agent, detected or not
 ./install.sh --no-agents             # just the binary
+./install.sh --from-source           # compile, even where a release exists
 ./install.sh --static                # a musl binary that runs on any Linux
 ./install.sh --uninstall
 ```
+
+Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed:
+static musl binaries for x86_64 and aarch64 Linux, and both macOS
+architectures, each with a `.sha256` beside it. Until a tag exists there are no
+assets to download and every install compiles — which is the same thing the
+installer does on any platform the matrix does not cover.
 
 Or build it yourself — Rust 1.97.1, pinned in `rust-toolchain.toml`:
 

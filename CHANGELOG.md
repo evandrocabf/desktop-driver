@@ -28,6 +28,11 @@ the binary and links the agent skill into whichever coding agents are present.
   invisible, marked `"accessible": false`: it can be screenshotted and clicked by coordinate, and
   `desktop snapshot` on it refuses instead of inventing an empty tree. Under Wayland the list still
   comes from AT-SPI frames, which is all a client there can see.
+- **Installation in one line** — `curl -fsSL .../install.sh | bash`, needing only curl and tar. The
+  source arrives as a tarball where git is absent, and the binary is downloaded from the matching
+  release and verified against its published SHA-256, falling back to a source build where no
+  release covers the platform. Releases are built for x86_64 and aarch64 Linux (static musl) and
+  both macOS architectures by `.github/workflows/release.yml` on a `v*` tag.
 - **`desktop session`** — a display of the agent's own: its own X server, D-Bus, accessibility bus
   and window manager, plus its own home directory so a browser opens a clean profile instead of
   yours and the two do not contend for one profile lock. Inside a session nothing is shared, so

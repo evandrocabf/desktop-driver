@@ -8,9 +8,15 @@
 #
 # It does two separable things:
 #
-#   1. builds the `desktop` binary and puts it on your PATH;
+#   1. puts the `desktop` binary on your PATH — a released build for this
+#      platform where there is one, otherwise built from source;
 #   2. links skills/desktop-driver/ into wherever your coding agents look for
 #      skills.
+#
+# Piped through `curl | bash` it needs curl and tar and nothing else: the source
+# arrives as a tarball when git is absent, and the binary is downloaded rather
+# than compiled when a release carries one for this platform. Both fall back to
+# the older path — clone, then cargo — and say which one they took.
 #
 # Everything it writes is named as it writes it, `--dry-run` shows the plan
 # without touching anything, and `--uninstall` removes exactly what was added.
@@ -41,6 +47,7 @@ FORCE=0
 DRY_RUN=0
 UNINSTALL=0
 STATIC=0
+FROM_SOURCE=0
 
 # ── output ───────────────────────────────────────────────────────────────────
 
@@ -60,6 +67,11 @@ warn() { printf '  %s!%s %s\n' "$YEL" "$R" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$RED" "$R" "$*" >&2; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Fails, having first removed a scratch directory. `die` exits, so a trap on
+# RETURN would never fire and a half-downloaded tree would be left behind on
+# every failed attempt.
+scrub() { local dir="$1"; shift; rm -rf "$dir"; die "$@"; }
 
 # Every path this script keeps is absolute.
 #
@@ -105,6 +117,7 @@ Options
   --no-agents       skip the skill entirely, just install the binary
   --no-bin          skip the binary, just install the skill
   --no-build        do not run cargo; use an already-built target/release/desktop
+  --from-source     always compile, even where a released binary is available
   --static          build a static musl binary (runs on any Linux, any glibc)
   --project DIR     install into DIR/.claude/... instead of your home directory
   --prefix DIR      where to put the binary (default: ~/.local/bin)
@@ -125,6 +138,7 @@ while [ $# -gt 0 ]; do
     --no-agents) NO_AGENTS=1; shift ;;
     --no-bin)    NO_BIN=1; shift ;;
     --no-build)  NO_BUILD=1; shift ;;
+    --from-source) FROM_SOURCE=1; shift ;;
     --static)    STATIC=1; shift ;;
     --project)   PROJECT_DIR="${2:-}"; shift 2 ;;
     --prefix)    PREFIX="${2:-}"; shift 2 ;;
@@ -281,8 +295,91 @@ resolve_source() {
   SRC_MODE="clone"
 }
 
+# owner/repo out of REPO_URL, or failure when it does not name GitHub — a
+# mirror, a fork over ssh, a path on disk. Everything downloaded rather than
+# cloned is derived from this, so a repository that cannot be named here simply
+# keeps the git path.
+repo_slug() {
+  local slug=""
+  case "$REPO_URL" in
+    https://github.com/*) slug="${REPO_URL#https://github.com/}" ;;
+    git@github.com:*)     slug="${REPO_URL#git@github.com:}" ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "${slug%.git}"
+}
+
+# The source, without git.
+#
+# `curl | bash` on a machine that has never cloned anything is the case this
+# exists for: git is a 40MB dependency for a copy of a directory, and codeload
+# hands over the same tree in one request. The tarball cannot be updated in
+# place the way a clone can, so it is unpacked over whatever was there — which
+# is only ever a directory this installer wrote, guarded below.
+fetch_tarball() {
+  local url tmp root
+  url="https://codeload.github.com/$(repo_slug)/tar.gz/${GIT_REF:-HEAD}"
+
+  step "Downloading the source"
+  if have git; then
+    info "${DIM}$SRC came down as a tarball rather than a clone, so this refreshes it the same way${R}"
+  else
+    info "${DIM}git is not installed, so this is a tarball rather than a clone${R}"
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "${DIM}would: curl -fsSL $url | tar -xz -C $SRC${R}"
+    return
+  fi
+
+  tmp="$(mktemp -d)"
+  curl -fsSL "$url" -o "$tmp/source.tar.gz" ||
+    scrub "$tmp" "cannot download $url (a private repository needs git and its credentials)"
+  tar -xzf "$tmp/source.tar.gz" -C "$tmp" ||
+    scrub "$tmp" "the downloaded archive could not be unpacked"
+
+  root=""
+  for candidate in "$tmp"/*/; do
+    if [ -d "$candidate" ]; then root="${candidate%/}"; break; fi
+  done
+  [ -n "$root" ] || scrub "$tmp" "the downloaded archive was empty"
+  is_checkout "$root" ||
+    scrub "$tmp" "the downloaded archive is not a desktop-driver source tree"
+
+  if is_checkout "$SRC"; then
+    # Copied over rather than swapped in: target/ holds the last build, which
+    # is minutes of compiling and is not in the archive. Deleting the tree to
+    # replace it would throw that away on every update.
+    cp -R "$root/." "$SRC/"
+  else
+    mkdir -p "$(dirname "$SRC")"
+    mv "$root" "$SRC"
+  fi
+  rm -rf "$tmp"
+  did "unpacked into $SRC"
+}
+
+# The source, by whichever route this machine supports.
+#
+# git is preferred where it is present *and* the tree it would act on is one it
+# can act on. A tree that arrived as a tarball has no .git in it, and asking git
+# to clone into a directory that already exists fails outright — so once a tree
+# is a tarball it stays one, refreshed the same way it arrived.
 clone_or_update() {
-  have git || die "git is required to fetch the source (or run install.sh from a checkout)"
+  local tarball_only=0
+  if ! have git; then tarball_only=1; fi
+  if [ ! -d "$SRC/.git" ] && is_checkout "$SRC"; then tarball_only=1; fi
+
+  if [ "$tarball_only" -eq 1 ]; then
+    have tar  || die "git or tar is required to fetch the source"
+    have curl || die "git or curl is required to fetch the source"
+    repo_slug >/dev/null ||
+      die "git is required to fetch the source from $REPO_URL"
+    if [ -e "$SRC" ] && ! is_checkout "$SRC"; then
+      die "$SRC exists and is not a desktop-driver checkout"
+    fi
+    fetch_tarball
+    return
+  fi
 
   if [ -d "$SRC/.git" ]; then
     step "Updating $SRC"
@@ -358,13 +455,24 @@ check_deps() {
   local v
   if have cargo; then
     v="$(cargo --version 2>/dev/null | awk '{print $2}')"
-    if version_at_least "$v" "$MIN_RUST"; then
+    if [ -z "$v" ]; then
+      # rustup on PATH with no toolchain behind it: `cargo` exists, answers
+      # nothing, and fails at the first build. Reported as missing rather than
+      # as "cargo  is older than 1.97.1", which is what an empty version read
+      # as when it reached the comparison.
+      CARGO_MISSING=1
+      warn "cargo is on PATH but no toolchain is installed behind it:"
+      info "      rustup default stable"
+    elif version_at_least "$v" "$MIN_RUST"; then
       ok "cargo $v"
     else
       warn "cargo $v is older than the required $MIN_RUST — upgrade with: rustup update"
     fi
   elif [ "$NO_BUILD" -eq 1 ]; then
     skip "cargo (not needed with --no-build)"
+  elif [ "$SRC_MODE" = "clone" ] && [ "$FROM_SOURCE" -eq 0 ] &&
+       release_target >/dev/null && repo_slug >/dev/null; then
+    skip "cargo (not needed unless the download falls through to a source build)"
   else
     CARGO_MISSING=1
     warn "cargo is not installed. desktop-driver is built from source; install Rust with:"
@@ -432,6 +540,94 @@ build_target_dir() {
   fi
 }
 
+# The release asset this machine can run, or failure where there is no such
+# build. Names are cargo target triples, which is what the release workflow
+# produces and what `rustc -vV` would call this machine.
+release_target() {
+  case "$(uname -s):$(uname -m)" in
+    Linux:x86_64)              echo "x86_64-unknown-linux-musl" ;;
+    Linux:aarch64|Linux:arm64) echo "aarch64-unknown-linux-musl" ;;
+    Darwin:arm64)              echo "aarch64-apple-darwin" ;;
+    Darwin:x86_64)             echo "x86_64-apple-darwin" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Tries to fetch a released binary, and reports whether it got one.
+#
+# Every failure here is soft. No release yet, an architecture nobody publishes
+# for, a repository that is not on GitHub, a machine with no network — all of
+# them mean "compile it instead", which is what this installer did before
+# releases existed. The one thing that is *not* soft is a checksum that does not
+# match: that is a corrupted or tampered download, and falling back to a source
+# build would bury it.
+download_binary() {
+  local target slug url tmp sum_url expected actual
+
+  [ "$FROM_SOURCE" -eq 0 ] || return 1
+  [ "$STATIC" -eq 0 ] || return 1
+  # Run from a checkout, the checkout is the point. Someone standing in their
+  # own working tree typed ./install.sh to install *that*, and handing them a
+  # released binary would quietly discard whatever they had just changed.
+  [ "$SRC_MODE" = "clone" ] || return 1
+  have curl || return 1
+  have tar  || return 1
+  target="$(release_target)" || return 1
+  slug="$(repo_slug)" || return 1
+
+  if [ -n "$GIT_REF" ]; then
+    url="https://github.com/$slug/releases/download/$GIT_REF/$BIN_NAME-$target.tar.gz"
+  else
+    url="https://github.com/$slug/releases/latest/download/$BIN_NAME-$target.tar.gz"
+  fi
+
+  step "Downloading a released binary"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "${DIM}would: curl -fsSL $url${R}"
+    info "${DIM}would: verify it against $url.sha256${R}"
+    BUILT_BIN="the downloaded $BIN_NAME-$target"
+    return 0
+  fi
+
+  tmp="$(mktemp -d)"
+  if ! curl -fsSL "$url" -o "$tmp/$BIN_NAME.tar.gz" 2>/dev/null; then
+    rm -rf "$tmp"
+    skip "no released build for $target — compiling instead"
+    return 1
+  fi
+
+  sum_url="$url.sha256"
+  if curl -fsSL "$sum_url" -o "$tmp/sha256" 2>/dev/null; then
+    expected="$(tr -d '\r' <"$tmp/sha256" | awk '{print $1}')"
+    actual="$(checksum "$tmp/$BIN_NAME.tar.gz")"
+    if [ -z "$actual" ]; then
+      warn "no sha256 tool here, so the download could not be verified"
+    elif [ "$expected" != "$actual" ]; then
+      scrub "$tmp" "checksum mismatch on $url (expected $expected, got $actual)"
+    else
+      ok "sha256 verified"
+    fi
+  fi
+
+  tar -xzf "$tmp/$BIN_NAME.tar.gz" -C "$tmp" ||
+    scrub "$tmp" "the downloaded archive could not be unpacked"
+  [ -f "$tmp/$BIN_NAME" ] ||
+    scrub "$tmp" "the downloaded archive does not contain $BIN_NAME"
+  chmod +x "$tmp/$BIN_NAME"
+
+  DOWNLOAD_TMP="$tmp"
+  BUILT_BIN="$tmp/$BIN_NAME"
+  did "downloaded $BIN_NAME-$target"
+  return 0
+}
+
+checksum() {
+  if have sha256sum; then sha256sum "$1" | awk '{print $1}'
+  elif have shasum;   then shasum -a 256 "$1" | awk '{print $1}'
+  else printf ''
+  fi
+}
+
 build_binary() {
   local built="$(build_target_dir)/$BIN_NAME"
 
@@ -442,7 +638,15 @@ build_binary() {
     return
   fi
 
-  have cargo || die "cargo is required to build (or pass --no-build with a prebuilt binary)"
+  if download_binary; then
+    return
+  fi
+
+  if ! have cargo; then
+    die "nothing to install from: no released binary was available for this platform
+       and cargo is not installed. Install Rust and run this again:
+         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+  fi
 
   step "Building"
   if [ "$STATIC" -eq 1 ]; then
@@ -664,6 +868,7 @@ NO_AGENT_DETECTED=0
 SRC=""
 SRC_MODE=""
 BUILT_BIN=""
+DOWNLOAD_TMP=""
 
 if [ -n "$PROJECT_DIR" ]; then
   [ -d "$PROJECT_DIR" ] || die "no such directory: $PROJECT_DIR"
@@ -729,6 +934,7 @@ if [ "$NO_BIN" -eq 0 ]; then
   build_binary
   say ""
   install_bin
+  if [ -n "$DOWNLOAD_TMP" ]; then rm -rf "$DOWNLOAD_TMP"; DOWNLOAD_TMP=""; fi
   say ""
 fi
 
@@ -776,6 +982,12 @@ info "Try it:   desktop apps && desktop snapshot --app <something you have open>
 if [ "$(uname -s)" != "Darwin" ]; then
   info "Isolate:  desktop session start   ${DIM}(a display of its own — never touches yours)${R}"
 fi
-info "Update:   git -C $SRC pull && $SRC/install.sh"
+if [ -d "$SRC/.git" ]; then
+  info "Update:   git -C $SRC pull && $SRC/install.sh"
+else
+  # No .git to pull: this tree came down as a tarball, and re-running the
+  # installer is what replaces it.
+  info "Update:   $SRC/install.sh"
+fi
 info "Remove:   $SRC/install.sh --uninstall"
 say ""
