@@ -71,3 +71,13 @@ the binary and links the agent skill into whichever coding agents are present.
 - Input under Wayland needs both the RemoteDesktop and ScreenCast portals, because absolute pointer
   positioning interprets its coordinates in a screencast stream's space. A session offering only one
   of the two reports no input backend instead of failing on its first click.
+- Focus under Wayland is attempted rather than refused outright: there is no client-initiated raise,
+  so the application is asked to present itself through `org.freedesktop.Application.Activate` and
+  the window is then checked for the active state. Applications exporting no such interface cannot
+  be asked, and a compositor may answer by marking the window as demanding attention, so this fails
+  honestly rather than reporting a focus that did not happen. GNOME's own window APIs —
+  `org.gnome.Shell.Introspect` and `org.gnome.Shell.Screenshot` — are allowlisted to the portal
+  implementations and are not available to this or any other third-party tool.
+- Portal-backed capabilities stop warning about the approval dialog once the grant has been
+  recorded. Screen capture already did; mouse, keyboard and scroll repeated the warning forever,
+  including on a machine where `desktop setup` had long since answered it.
