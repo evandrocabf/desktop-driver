@@ -23,6 +23,8 @@
 
 set -eu
 
+ORIGINAL_ARGS=("$@")
+
 REPO_URL="${DESKTOP_DRIVER_REPO:-https://github.com/evandrocabf/desktop-driver.git}"
 SKILL_NAME="desktop-driver"
 MARKER="desktop-driver-installer"
@@ -46,6 +48,7 @@ COPY=0
 FORCE=0
 DRY_RUN=0
 UNINSTALL=0
+UPDATE=0
 STATIC=0
 FROM_SOURCE=0
 
@@ -127,6 +130,7 @@ Options
   --force           overwrite files this installer did not create
   --dry-run         print the plan, write nothing
   --uninstall       remove what this installer added
+  --update          refresh the installed checkout before reinstalling
   -h, --help        this
 EOF
 }
@@ -148,6 +152,7 @@ while [ $# -gt 0 ]; do
     --force)     FORCE=1; shift ;;
     --dry-run)   DRY_RUN=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
+    --update)    UPDATE=1; shift ;;
     -h|--help)   usage; exit 0 ;;
     *)           die "unknown option: $1 (try --help)" ;;
   esac
@@ -271,7 +276,7 @@ is_checkout() {
 }
 
 # A subdirectory, not the namespace itself: `desktop session` keeps the agent's
-# private home at $XDG_DATA_HOME/desktop-driver/home, so cloning over the parent
+# private homes under $XDG_DATA_HOME/desktop-driver/sessions, so cloning over the parent
 # either refuses to run — on any machine where a session came first — or, worse,
 # succeeds and leaves the agent's browser profile living inside a git working
 # tree, where `git status` reports it and `git clean -xfd` deletes it.
@@ -285,7 +290,7 @@ resolve_source() {
   self="${BASH_SOURCE[0]:-}"
   if [ -n "$self" ] && [ -f "$self" ]; then
     script_dir="$(cd "$(dirname "$self")" && pwd)"
-    if is_checkout "$script_dir" && [ -z "$GIT_REF" ] && [ -z "$SRC_DIR_ARG" ]; then
+    if is_checkout "$script_dir" && [ "$UPDATE" -eq 0 ] && [ -z "$GIT_REF" ] && [ -z "$SRC_DIR_ARG" ]; then
       SRC="$script_dir"
       SRC_MODE="local"
       return
@@ -293,6 +298,39 @@ resolve_source() {
   fi
   SRC="$(absolute "${SRC_DIR_ARG:-$(default_src_dir)}")"
   SRC_MODE="clone"
+}
+
+# Updating a tarball checkout overwrites install.sh itself. Bash does not
+# promise to have read the whole file before that happens, so run the updater
+# from a temporary copy that is outside the checkout. The original checkout
+# path is passed explicitly because the temporary script is not in a source tree.
+bootstrap_update() {
+  local self script_dir tmp status
+  [ "$UPDATE" -eq 1 ] || return 0
+  [ "${DESKTOP_DRIVER_UPDATE_BOOTSTRAPPED:-0}" -eq 0 ] || return 0
+  self="${BASH_SOURCE[0]:-}"
+  [ -n "$self" ] && [ -f "$self" ] || return 0
+  script_dir="$(cd "$(dirname "$self")" && pwd)"
+  is_checkout "$script_dir" || return 0
+
+  tmp="$(mktemp /tmp/desktop-driver-update.XXXXXX)"
+  cp "$self" "$tmp"
+  chmod 700 "$tmp"
+  if [ -z "$SRC_DIR_ARG" ]; then
+    if DESKTOP_DRIVER_UPDATE_BOOTSTRAPPED=1 bash "$tmp" "${ORIGINAL_ARGS[@]}" --src "$script_dir"; then
+      status=0
+    else
+      status=$?
+    fi
+  else
+    if DESKTOP_DRIVER_UPDATE_BOOTSTRAPPED=1 bash "$tmp" "${ORIGINAL_ARGS[@]}"; then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+  rm -f "$tmp"
+  exit "$status"
 }
 
 # owner/repo out of REPO_URL, or failure when it does not name GitHub — a
@@ -562,7 +600,7 @@ release_target() {
 # match: that is a corrupted or tampered download, and falling back to a source
 # build would bury it.
 download_binary() {
-  local target slug url tmp sum_url expected actual
+  local target slug url tmp sum_url expected actual expected_version actual_version
 
   [ "$FROM_SOURCE" -eq 0 ] || return 1
   [ "$STATIC" -eq 0 ] || return 1
@@ -615,6 +653,17 @@ download_binary() {
     scrub "$tmp" "the downloaded archive does not contain $BIN_NAME"
   chmod +x "$tmp/$BIN_NAME"
 
+  expected_version="$(source_version)"
+  actual_version="$(binary_version "$tmp/$BIN_NAME")"
+  if [ -z "$actual_version" ]; then
+    scrub "$tmp" "the downloaded binary does not report a version"
+  fi
+  if [ "$actual_version" != "$expected_version" ]; then
+    rm -rf "$tmp"
+    skip "latest released build is $actual_version, but source is $expected_version — compiling instead"
+    return 1
+  fi
+
   DOWNLOAD_TMP="$tmp"
   BUILT_BIN="$tmp/$BIN_NAME"
   did "downloaded $BIN_NAME-$target"
@@ -628,11 +677,30 @@ checksum() {
   fi
 }
 
+source_version() {
+  sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' "$SRC/Cargo.toml" | head -n 1
+}
+
+binary_version() {
+  "$1" --version 2>/dev/null | awk '{print $2}'
+}
+
+verify_binary_version() {
+  local binary="$1" expected actual
+  expected="$(source_version)"
+  [ -n "$expected" ] || die "cannot read the workspace version from $SRC/Cargo.toml"
+  actual="$(binary_version "$binary")"
+  [ -n "$actual" ] || die "$binary does not report its version"
+  [ "$actual" = "$expected" ] ||
+    die "$binary is version $actual, but the source being installed is $expected"
+}
+
 build_binary() {
   local built="$(build_target_dir)/$BIN_NAME"
 
   if [ "$NO_BUILD" -eq 1 ]; then
     [ -x "$built" ] || die "--no-build was given but $built does not exist"
+    verify_binary_version "$built"
     ok "using the existing $built"
     BUILT_BIN="$built"
     return
@@ -659,12 +727,13 @@ build_binary() {
   fi
   did "built $built"
   BUILT_BIN="$built"
+  if [ "$DRY_RUN" -eq 0 ]; then verify_binary_version "$BUILT_BIN"; fi
 }
 
 install_bin() {
   step "Installing the binary into $PREFIX"
 
-  local dest="$PREFIX/$BIN_NAME"
+  local dest="$PREFIX/$BIN_NAME" previous_version="" installed_version
 
   if [ -e "$dest" ] && ! is_ours "$dest" && [ "$FORCE" -eq 0 ]; then
     warn "$dest exists and was not written by this installer — skipping (use --force)"
@@ -677,6 +746,8 @@ install_bin() {
     return
   fi
 
+  if [ -x "$dest" ]; then previous_version="$(binary_version "$dest")"; fi
+
   mkdir -p "$PREFIX" "$MANIFEST_DIR"
   # Installed rather than copied in place: replacing a running binary in-place
   # would break whatever is executing it right now.
@@ -686,7 +757,12 @@ install_bin() {
   chmod 755 "$tmp"
   mv -f "$tmp" "$dest"
   printf '%s\n' "$dest" >"$MANIFEST"
-  ok "$dest"
+  installed_version="$(binary_version "$dest")"
+  if [ -n "$previous_version" ] && [ "$previous_version" != "$installed_version" ]; then
+    ok "$dest ${DIM}($previous_version → $installed_version)${R}"
+  else
+    ok "$dest ${DIM}(version $installed_version)${R}"
+  fi
 
   case ":${PATH}:" in
     *":$PREFIX:"*) ;;
@@ -882,6 +958,11 @@ if [ "$STATIC" -eq 1 ] && [ "$(uname -s)" = "Darwin" ]; then
   die "--static builds a Linux musl binary and cannot be used on macOS"
 fi
 
+if [ "$UPDATE" -eq 1 ] && [ "$UNINSTALL" -eq 1 ]; then
+  die "--update and --uninstall cannot be used together"
+fi
+
+bootstrap_update
 resolve_source
 
 if [ "$UNINSTALL" -eq 0 ] && [ "$SRC_MODE" = "clone" ]; then
@@ -980,14 +1061,14 @@ say ""
 info "Verify:   desktop doctor"
 info "Try it:   desktop apps && desktop snapshot --app <something you have open>"
 if [ "$(uname -s)" != "Darwin" ]; then
-  info "Isolate:  desktop session start   ${DIM}(a display of its own — never touches yours)${R}"
+  info "Session:  desktop session create NAME && desktop session start NAME --visible"
 fi
 if [ -d "$SRC/.git" ]; then
-  info "Update:   git -C $SRC pull && $SRC/install.sh"
+  info "Update:   $SRC/install.sh --update"
 else
   # No .git to pull: this tree came down as a tarball, and re-running the
   # installer is what replaces it.
-  info "Update:   $SRC/install.sh"
+  info "Update:   $SRC/install.sh --update"
 fi
 info "Remove:   $SRC/install.sh --uninstall"
 say ""

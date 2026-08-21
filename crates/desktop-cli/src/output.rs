@@ -393,15 +393,24 @@ pub fn render_session_started(
 ) -> Rendered {
     if sink.is_json() {
         let mut value = serde_json::to_value(session.redacted()).unwrap_or_else(|_| json!({}));
-        if let (Some(reason), Some(object)) = (unwatchable, value.as_object_mut()) {
-            object.insert("unwatchable".to_owned(), json!(reason));
+        if let Some(object) = value.as_object_mut() {
+            if let Some(reason) = unwatchable {
+                object.insert("unwatchable".to_owned(), json!(reason));
+            }
+            object.insert(
+                "login_handoff".to_owned(),
+                json!({
+                    "visible": session.visible,
+                    "credentials_must_be_entered_by_user": true,
+                }),
+            );
         }
         sink.value(&value);
         return Ok(());
     }
     sink.line(&format!(
-        "Started an agent display on {} ({}x{}).",
-        session.display, session.width, session.height
+        "Started session {:?} on {} ({}x{}).",
+        session.name, session.display, session.width, session.height
     ));
     sink.blank();
     sink.line("Every command now addresses it instead of your screen. It has its own");
@@ -414,6 +423,10 @@ pub fn render_session_started(
         sink.line("It is in the window titled \"desktop-driver\" on your desktop — watch it");
         sink.line("there, and click into it if you want to take over. Watching changes");
         sink.line("nothing about the isolation.");
+        sink.blank();
+        sink.line("LOGIN HANDOFF: if the site asks for credentials, ask the user to take over");
+        sink.line("this visible window and sign in directly. Never ask them to send passwords,");
+        sink.line("one-time codes or other secrets through the agent or model.");
     } else if let Some(reason) = unwatchable {
         sink.line(&format!("You cannot watch it: {reason}."));
         sink.line("`desktop screenshot` is how to see what the agent sees.");
@@ -426,6 +439,96 @@ pub fn render_session_started(
     sink.line("  desktop screenshot               see it");
     sink.line("  desktop --host screenshot        see your own screen instead");
     sink.line("  desktop session stop             end it");
+    Ok(())
+}
+
+pub fn render_session_created(
+    sink: &mut Sink<'_>,
+    profile: &desktop_core::SessionProfile,
+) -> Rendered {
+    if sink.is_json() {
+        sink.value(&json!({
+            "created": true,
+            "session": profile,
+            "next": format!("desktop session start {} --visible", profile.name),
+            "credentials_must_be_entered_by_user": true,
+        }));
+        return Ok(());
+    }
+    sink.line(&format!("Created persistent session {:?}.", profile.name));
+    sink.line(&format!(
+        "Its private browser home is {}.",
+        profile.home.display()
+    ));
+    sink.blank();
+    sink.line("Start it visibly before login, then launch the browser:");
+    sink.blank();
+    sink.line(&format!(
+        "  desktop session start {} --visible",
+        profile.name
+    ));
+    sink.line("  desktop session run firefox https://example.com");
+    sink.blank();
+    sink.line("The user must type credentials directly into the visible browser window.");
+    sink.line("Never request passwords or one-time codes through the agent or model.");
+    Ok(())
+}
+
+pub fn render_session_list(
+    sink: &mut Sink<'_>,
+    profiles: &[desktop_core::SessionProfile],
+    running: Option<&AgentSession>,
+) -> Rendered {
+    if sink.is_json() {
+        let sessions: Vec<_> = profiles
+            .iter()
+            .map(|profile| {
+                json!({
+                    "name": profile.name,
+                    "home": profile.home,
+                    "running": running.is_some_and(|session| session.name == profile.name),
+                })
+            })
+            .collect();
+        sink.value(&json!({ "sessions": sessions }));
+        return Ok(());
+    }
+    if profiles.is_empty() {
+        sink.line("No persistent sessions have been created.");
+        return Ok(());
+    }
+    sink.line("Persistent sessions:");
+    sink.blank();
+    for profile in profiles {
+        let state = if running.is_some_and(|session| session.name == profile.name) {
+            "running"
+        } else {
+            "stopped"
+        };
+        sink.line(&format!("  {:<24} {state}", profile.name));
+    }
+    Ok(())
+}
+
+pub fn render_session_deleted(
+    sink: &mut Sink<'_>,
+    profile: Option<&desktop_core::SessionProfile>,
+    requested: &str,
+) -> Rendered {
+    if sink.is_json() {
+        sink.value(&json!({
+            "deleted": profile.is_some(),
+            "name": requested,
+            "saved_logins_removed": profile.is_some(),
+        }));
+        return Ok(());
+    }
+    match profile {
+        Some(_) => sink.line(&format!(
+            "Deleted session {requested:?}, including its cookies and saved logins."
+        )),
+        None => sink.line(&format!("Session {requested:?} does not exist.")),
+    }
     Ok(())
 }
 
@@ -470,7 +573,8 @@ pub fn render_session_status(
     };
 
     sink.line(&format!(
-        "Agent display:  {} ({}x{}){}",
+        "Session:        {:?}\nAgent display:  {} ({}x{}){}",
+        session.name,
         session.display,
         session.width,
         session.height,
@@ -496,16 +600,19 @@ pub fn render_session_stopped(sink: &mut Sink<'_>, session: Option<&AgentSession
         sink.value(&json!({
             "stopped": session.is_some(),
             "display": session.map(|session| session.display.clone()),
+            "name": session.map(|session| session.name.clone()),
+            "browser_state_preserved": session.is_some(),
         }));
         return Ok(());
     }
     match session {
         Some(session) => {
             sink.line(&format!(
-                "Stopped the agent display on {} and everything running on it.",
-                session.display
+                "Stopped session {:?} on {} and everything running on it.",
+                session.name, session.display
             ));
             sink.blank();
+            sink.line("Its private browser profile, cookies and saved logins were preserved.");
             sink.line("Commands now address your own desktop again.");
         }
         None => sink.line("No agent display was running."),
@@ -533,6 +640,11 @@ pub fn render_session_launched(
     ));
     sink.blank();
     sink.line("It may take a moment to appear. `desktop apps` lists what is running there.");
+    if session.visible {
+        sink.blank();
+        sink.line("If sign-in is required, ask the user to take over the visible session window");
+        sink.line("and enter credentials there. Never request or type their secrets for them.");
+    }
     Ok(())
 }
 

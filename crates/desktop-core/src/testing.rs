@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    agent::{AgentSession, SessionHost, SessionProcess, StartOptions},
+    agent::{AgentSession, SessionHost, SessionProcess, SessionProfile, StartOptions},
     errors::{PermissionState, Result},
     models::{
         app::{AppKey, Application, Window},
@@ -433,6 +433,7 @@ impl PlatformProbe for FakeProbe {
 pub struct FakeSessions {
     running: Mutex<Option<AgentSession>>,
     launched: Mutex<Vec<(String, Vec<String>)>>,
+    profiles: Mutex<Vec<SessionProfile>>,
 }
 
 impl FakeSessions {
@@ -451,6 +452,7 @@ impl FakeSessions {
     #[must_use]
     pub fn example() -> AgentSession {
         AgentSession {
+            name: "default".to_owned(),
             display: ":97".to_owned(),
             width: 1920,
             height: 1080,
@@ -460,7 +462,7 @@ impl FakeSessions {
             cookie: "00112233445566778899aabbccddeeff".to_owned(),
             visible: true,
             home: Some(std::path::PathBuf::from(
-                "/home/agent/.local/share/desktop-driver/home",
+                "/home/agent/.local/share/desktop-driver/sessions/default/home",
             )),
             processes: vec![SessionProcess::new("Xvfb", 4242)],
         }
@@ -473,18 +475,66 @@ impl FakeSessions {
 }
 
 impl SessionHost for FakeSessions {
+    fn create(&self, name: &str) -> Result<SessionProfile> {
+        crate::agent::validate_session_name(name)?;
+        let mut profiles = self.profiles.lock().expect("not poisoned");
+        if profiles.iter().any(|profile| profile.name == name) {
+            return Err(crate::errors::DesktopError::invalid_argument(format!(
+                "session {name:?} already exists"
+            )));
+        }
+        let profile = SessionProfile {
+            name: name.to_owned(),
+            home: format!("/home/agent/.local/share/desktop-driver/sessions/{name}/home").into(),
+        };
+        profiles.push(profile.clone());
+        Ok(profile)
+    }
+
+    fn list(&self) -> Result<Vec<SessionProfile>> {
+        Ok(self.profiles.lock().expect("not poisoned").clone())
+    }
+
+    fn delete(&self, name: &str) -> Result<Option<SessionProfile>> {
+        if self.status().is_some_and(|session| session.name == name) {
+            return Err(crate::errors::DesktopError::invalid_argument(
+                "cannot delete a running session",
+            ));
+        }
+        let mut profiles = self.profiles.lock().expect("not poisoned");
+        let Some(index) = profiles.iter().position(|profile| profile.name == name) else {
+            return Ok(None);
+        };
+        Ok(Some(profiles.remove(index)))
+    }
+
     fn start(&self, options: StartOptions) -> Result<AgentSession> {
+        let home = {
+            let mut profiles = self.profiles.lock().expect("not poisoned");
+            if let Some(profile) = profiles.iter().find(|profile| profile.name == options.name) {
+                profile.home.clone()
+            } else {
+                let profile = SessionProfile {
+                    name: options.name.clone(),
+                    home: format!(
+                        "/home/agent/.local/share/desktop-driver/sessions/{}/home",
+                        options.name
+                    )
+                    .into(),
+                };
+                let home = profile.home.clone();
+                profiles.push(profile);
+                home
+            }
+        };
         let session = AgentSession {
+            name: options.name,
             width: options.width,
             height: options.height,
             display: options
                 .display
                 .map_or_else(|| ":97".to_owned(), |number| format!(":{number}")),
-            home: if options.share_home {
-                None
-            } else {
-                Self::example().home
-            },
+            home: if options.share_home { None } else { Some(home) },
             ..Self::example()
         };
         *self.running.lock().expect("not poisoned") = Some(session.clone());
