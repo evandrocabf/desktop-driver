@@ -114,6 +114,12 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
+    /// Create a persistent, isolated browser workspace.
+    Create(SessionNameArgs),
+
+    /// List persistent browser workspaces.
+    List,
+
     /// Start a display only the agent can see, and only the agent can type on.
     Start(SessionStartArgs),
 
@@ -123,6 +129,9 @@ pub enum SessionCommand {
     /// End the session and everything running on it.
     Stop,
 
+    /// Permanently remove a workspace, including its cookies and saved logins.
+    Delete(SessionNameArgs),
+
     /// Launch a program onto the agent's display.
     Run(SessionRunArgs),
 
@@ -131,7 +140,17 @@ pub enum SessionCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct SessionNameArgs {
+    /// Persistent workspace name.
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
 pub struct SessionStartArgs {
+    /// Persistent workspace name. Defaults to the backwards-compatible workspace.
+    #[arg(default_value = "default")]
+    pub name: String,
+
     /// Screen size, e.g. 1920x1080.
     #[arg(long, default_value = "1920x1080", value_name = "WxH")]
     pub size: String,
@@ -514,6 +533,22 @@ mod tests {
             Cli::try_parse_from(["desktop", "session", "start", "--visible", "--headless"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_named_session_is_positional_and_default_remains_backwards_compatible() {
+        let named = Cli::try_parse_from(["desktop", "session", "start", "github"])
+            .expect("named session parses");
+        let default =
+            Cli::try_parse_from(["desktop", "session", "start"]).expect("default session parses");
+        match named.command {
+            Command::Session(SessionCommand::Start(args)) => assert_eq!(args.name, "github"),
+            other => panic!("expected named start, got {other:?}"),
+        }
+        match default.command {
+            Command::Session(SessionCommand::Start(args)) => assert_eq!(args.name, "default"),
+            other => panic!("expected default start, got {other:?}"),
+        }
     }
 
     #[test]

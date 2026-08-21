@@ -99,7 +99,8 @@ All three stop being problems once the agent stops sharing the desktop at all.
 manager, its own D-Bus and its own accessibility bus:
 
 ```bash
-desktop session start                  # a 1920x1080 display of its own
+desktop session create github          # a durable, isolated browser profile
+desktop session start github --visible # a 1920x1080 display the user can take over
 desktop session run firefox            # launch something onto it
 desktop snapshot                       # the agent's windows, not yours
 desktop screenshot                     # pixels that contain nothing of yours
@@ -160,12 +161,12 @@ You cannot watch it: Xephyr is not installed.
 ```
 
 ```bash
-desktop session start --headless   # opt out: a long unattended run
-desktop session start --visible    # refuse to start at all if it cannot be watched
+desktop session start github --headless # opt out: a long unattended run
+desktop session start github --visible  # refuse unless the user can watch and take over
 ```
 
 **A session gets its own home directory too**, at
-`$XDG_DATA_HOME/desktop-driver/home`, with `HOME` and the `XDG_*` directories
+`$XDG_DATA_HOME/desktop-driver/sessions/<name>/home`, with `HOME` and the `XDG_*` directories
 redirected into it. A separate display alone is not separate enough: Firefox,
 Chrome and VS Code are all single-instance and coordinate through a lock file
 in the profile, so an agent launching one with your `HOME` either drives *your*
@@ -173,9 +174,17 @@ window or holds the lock and leaves you unable to start your own browser at
 all. Sharing a home also means the agent arrives logged in to everything you
 are logged in to, and screenshots of those pages are as private as the pages.
 
-The home persists between sessions, so an agent that logs into something stays
-logged in. `XDG_RUNTIME_DIR` is deliberately not redirected — the accessibility
+Each named home persists between starts, so closing the display does not discard
+cookies or saved logins. The legacy global home is migrated into the `default`
+session on first use. `XDG_RUNTIME_DIR` is deliberately not redirected — the accessibility
 socket lives there and must stay the real per-user directory.
+
+For an initial login, start with `--visible`, launch the browser, and hand the
+visible window to the user. The user enters passwords and one-time codes directly
+in the browser; credentials must never be requested through the agent or model.
+Afterwards, `desktop session stop` preserves the profile and
+`desktop session start <name>` reuses it. `desktop session delete <name>` is the
+explicit destructive operation that removes its cookies and saved logins.
 
 `--share-home` opts out when you actually want the agent working with your own
 profiles and logins:
@@ -370,12 +379,22 @@ it added.
 ./install.sh --no-agents             # just the binary
 ./install.sh --from-source           # compile, even where a release exists
 ./install.sh --static                # a musl binary that runs on any Linux
+./install.sh --update                # refresh checkout, binary and installed skills
 ./install.sh --uninstall
 ```
 
-Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed:
+Updating is the same safe, atomic installation path as the first install. Run
+the checkout's `install.sh --update`, or rerun the one-line `curl` command if
+the existing installation predates the `--update` option. Git checkouts are
+fast-forwarded; tarball checkouts are refreshed in place. The installer checks
+that the replacement binary reports the same version as the fetched source
+before replacing the installed executable, and leaves persistent browser
+profiles outside the checkout untouched.
+
+Version `0.1.0` is the first release. Releases are built by
+`.github/workflows/release.yml` when a matching `v*` tag is pushed:
 static musl binaries for x86_64 and aarch64 Linux, and both macOS
-architectures, each with a `.sha256` beside it. Until a tag exists there are no
+architectures, each with a `.sha256` beside it. Until the `v0.1.0` tag exists there are no
 assets to download and every install compiles — which is the same thing the
 installer does on any platform the matrix does not cover.
 
@@ -551,11 +570,14 @@ desktop type --element 23 "x.com"        # straight into the field (no keystroke
 desktop key   "cmd+s"
 desktop scroll --y -500
 
-desktop session start [--size 1440x900] [--display 90]
+desktop session create NAME
+desktop session list
+desktop session start [NAME] [--size 1440x900] [--display 90] [--visible]
 desktop session status
 desktop session run firefox https://x.com
 desktop session env                      # exports for running something by hand
 desktop session stop
+desktop session delete NAME             # permanently removes saved browser state
 
 desktop --host screenshot                # your desktop, ignoring the session
 ```
@@ -619,9 +641,9 @@ when found rather than trusted.
 | screenshots (default) | `$XDG_RUNTIME_DIR/desktop-driver/` | `0600` |
 | snapshots | `$XDG_RUNTIME_DIR/desktop-driver/snapshot.json` | `0600` |
 | session record (holds the display cookie) | `$XDG_RUNTIME_DIR/desktop-driver/` | `0600` |
-| the display's `Xauthority` | `$XDG_RUNTIME_DIR/desktop-driver/` | `0600` |
+| the display's `Xauthority` | `$XDG_RUNTIME_DIR/desktop-driver/sessions/<name>/` | `0600` |
 | portal restore token | `$XDG_STATE_HOME/desktop-driver/` | `0600` |
-| the agent's home (browser profiles) | `$XDG_DATA_HOME/desktop-driver/home` | `0700` |
+| named browser profiles | `$XDG_DATA_HOME/desktop-driver/sessions/<name>/home` | `0700` |
 
 The default capture location matters more than it looks: it used to be the
 shared temporary directory, which is mode `1777`, so every account on the
@@ -685,7 +707,7 @@ the CLI stay synchronous.
 ## Development
 
 ```bash
-cargo test --workspace                             # 308 tests, no desktop needed
+cargo test --workspace                             # no desktop needed
 cargo xtask architecture                           # layering and pinning gates
 cargo clippy --all-targets -- -D warnings
 cargo check --target aarch64-apple-darwin --workspace   # type-check macOS from anywhere

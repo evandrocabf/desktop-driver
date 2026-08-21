@@ -39,21 +39,30 @@ the pointer or keyboard is refused with exit 3 rather than racing the user.
 an installer, test the app you are building — give the agent a display of its own:
 
 ```bash
-desktop session start                # an X server nobody is looking at
+desktop session create example      # a durable, isolated browser profile
+desktop session start example --visible
 desktop session run firefox https://example.com
 desktop snapshot                     # the agent's windows, not the user's
 desktop screenshot --output /tmp/shot.png
 desktop session stop                 # when finished
 ```
 
+**Authentication is a user handoff, never an agent task.** For a new login, create a named
+session, start it with `--visible`, and launch the browser. Then ask the user to click into the
+visible `desktop-driver` window and enter passwords, passkeys and one-time codes themselves.
+Never ask them to paste credentials into chat, and never type credentials on their behalf. Wait
+for the user to confirm that login is complete before continuing. If `--visible` cannot be
+provided, stop and explain why; do not fall back to a headless credential flow.
+
 Inside a session nothing is shared, so focus, clicks, typing and screenshots all work and none of
 them can reach the user's screen. **Once a session exists every command addresses it by default**
 and says so — human output starts with `[agent display :90]`, JSON carries a `"display"` field.
 `--host` targets the user's real desktop for a single command.
 
-A session also gets its own home directory, so a browser opens a clean profile instead of the
-user's, and the two do not fight over the same profile lock. `desktop session start --share-home`
-opts out when you genuinely need the user's logins.
+A named session also gets its own persistent home directory, so a browser reuses its cookies and
+saved login after `session stop` and a later `session start <name>`. Different names do not share
+profiles. `desktop session delete <name>` permanently removes that state. `--share-home` applies
+only to the backwards-compatible `default` session and should not be used for a credential handoff.
 
 **The user can watch by default.** A session opens as a window titled `desktop-driver` on their
 desktop, so they can see what you are doing and click in to take over. That changes nothing about
@@ -190,6 +199,8 @@ Branch on these rather than parsing output. In `--json`, errors are a single obj
 5. **Stop sessions you start.** They hold an X server and everything running on it until stopped.
 6. **Passwords are never readable.** Secure fields come back `redacted: true` with a null value, by
    design and not as policy — do not try to work around it.
+7. **For login, hand the visible window to the user.** Never request, observe or type their
+   credentials. Continue only after the user says the login is complete.
 
 ## Safety flags
 

@@ -345,7 +345,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "desktop-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "desktop-core",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "schemars",
  "serde",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-linux"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ashpd",
  "atspi",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-macos"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "block2",
  "desktop-core",
@@ -1366,7 +1366,7 @@ checksum = "acf4d1bc32aa46eec18caa634ec3cf4c05bfa151f12b93b510b15190f69a1ca8"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "zbus"

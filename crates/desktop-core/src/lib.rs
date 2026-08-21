@@ -22,7 +22,8 @@ pub mod session;
 pub mod testing;
 
 pub use agent::{
-    AgentSession, AgentSessionStore, NoSessionHost, SessionHost, SessionProcess, StartOptions,
+    AgentSession, AgentSessionStore, NoSessionHost, SessionHost, SessionProcess, SessionProfile,
+    SessionProfileStore, StartOptions,
 };
 pub use driver::{Activation, Driver};
 pub use errors::{DesktopError, ExitCategory, Permission, PermissionState, Result};

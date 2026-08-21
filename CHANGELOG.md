@@ -6,8 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing is published to a registry yet. Install from the repository with `install.sh`, which builds
-the binary and links the agent skill into whichever coding agents are present.
+Nothing yet.
+
+## [0.1.0] - 2026-08-21
+
+The first release. Install from the repository with `install.sh`, which downloads or builds the
+binary and links the agent skill into whichever coding agents are present.
 
 ### Added
 
@@ -33,12 +37,20 @@ the binary and links the agent skill into whichever coding agents are present.
   release and verified against its published SHA-256, falling back to a source build where no
   release covers the platform. Releases are built for x86_64 and aarch64 Linux (static musl) and
   both macOS architectures by `.github/workflows/release.yml` on a `v*` tag.
+- **Reliable updates.** `install.sh --update` refreshes both Git and tarball checkouts, verifies that
+  a downloaded or built binary matches the source version, atomically replaces an installer-owned
+  binary, refreshes copied skills, and leaves persistent browser profiles outside the checkout.
 - **`desktop session`** — a display of the agent's own: its own X server, D-Bus, accessibility bus
   and window manager, plus its own home directory so a browser opens a clean profile instead of
   yours and the two do not contend for one profile lock. Inside a session nothing is shared, so
   focus, window capture and pointer input all work where they cannot on GNOME Wayland. It is
   **visible by default**, rendered into a window you can watch and click into to take over; where a
   window is impossible it starts headless and says so.
+- **Named persistent browser sessions.** `session create`, `list`, `start <name>` and `delete`
+  isolate durable browser homes while keeping display credentials and pids in runtime storage.
+  The legacy home becomes the `default` session, applications are asked to exit before the display
+  so they can flush browser state, and every visible start/run explains that the user—not the
+  agent or model—must enter passwords and one-time codes directly in the visible window.
 - **Honest capability reporting.** `desktop capabilities` reports every operation as supported,
   degraded with a stated caveat, or unsupported with a machine-readable reason. `desktop doctor`
   explains why a tree is empty and prints the exact install command for the distribution in hand.

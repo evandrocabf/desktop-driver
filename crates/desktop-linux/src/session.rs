@@ -261,7 +261,11 @@ fn choose_server(visibility: Visibility) -> Result<(XServer, Option<Unwatchable>
 /// Once the first process is running, any later failure has to take down
 /// whatever already started, or the machine is left with an orphaned X server
 /// and no record of it.
-pub fn start(options: StartOptions, store: &AgentSessionStore) -> Result<AgentSession> {
+pub fn start(
+    options: StartOptions,
+    store: &AgentSessionStore,
+    profiles: &desktop_core::SessionProfileStore,
+) -> Result<AgentSession> {
     if let Some(existing) = current(store) {
         return Err(DesktopError::InvalidArgument {
             message: format!(
@@ -302,23 +306,28 @@ pub fn start(options: StartOptions, store: &AgentSessionStore) -> Result<AgentSe
     };
     let display = format!(":{number}");
 
+    if options.share_home && options.name != "default" {
+        return Err(DesktopError::invalid_argument(
+            "a named persistent session cannot use --share-home; omit it to keep logins isolated",
+        ));
+    }
+    let profile = profiles.ensure(&options.name)?;
+
     let cookie = random_cookie()?;
-    let xauthority = xauthority_path();
+    let xauthority = xauthority_path(&options.name);
     write_xauthority(&xauthority, number, &cookie)?;
 
     let home = if options.share_home {
         None
     } else {
-        let home = desktop_core::agent::default_agent_home();
-        desktop_core::agent::create_private_dir(&home)?;
-        Some(home)
+        Some(profile.home)
     };
 
     let mut started: Vec<(String, Child)> = Vec::new();
     let outcome = assemble(
         &Plan {
             display: &display,
-            options,
+            options: &options,
             server,
             xauthority: &xauthority,
             cookie: &cookie,
@@ -342,6 +351,7 @@ pub fn start(options: StartOptions, store: &AgentSessionStore) -> Result<AgentSe
     };
 
     let session = AgentSession {
+        name: options.name,
         display,
         width: options.width,
         height: options.height,
@@ -367,7 +377,7 @@ pub fn start(options: StartOptions, store: &AgentSessionStore) -> Result<AgentSe
 /// Everything `assemble` needs, gathered before anything is started.
 struct Plan<'a> {
     display: &'a str,
-    options: StartOptions,
+    options: &'a StartOptions,
     server: XServer,
     xauthority: &'a Path,
     /// The display's cookie, for connecting back to it before any environment
@@ -394,16 +404,14 @@ struct Plan<'a> {
 /// Only `IsEnabled` is written — never `ScreenReaderEnabled`, which on GNOME
 /// starts Orca reading the screen aloud.
 fn assemble(plan: &Plan<'_>, started: &mut Vec<(String, Child)>) -> Result<(String, String)> {
-    let Plan {
-        display,
-        options,
-        server,
-        xauthority,
-        cookie,
-        home,
-        launcher,
-        registryd,
-    } = *plan;
+    let display = plan.display;
+    let options = plan.options;
+    let server = plan.server;
+    let xauthority = plan.xauthority;
+    let cookie = plan.cookie;
+    let home = plan.home;
+    let launcher = plan.launcher;
+    let registryd = plan.registryd;
     let authority = xauthority.display().to_string();
     let geometry = format!("{}x{}", options.width, options.height);
     let screen = format!("{geometry}x24");
@@ -609,12 +617,40 @@ where
 ///
 /// Processes are signalled in reverse order, so the window manager and the
 /// accessibility services see a live X server while they shut down.
+/// Applications are appended after those services and receive `SIGTERM`
+/// first, with a short grace period to flush browser cookies and local storage
+/// while their X connection is still alive.
 pub fn stop(store: &AgentSessionStore) -> Result<Option<AgentSession>> {
     let Some(session) = store.load() else {
         return Ok(None);
     };
 
-    for process in session.processes.iter().rev() {
+    for process in session
+        .processes
+        .iter()
+        .rev()
+        .filter(|process| process.application)
+    {
+        if process_matches(process) {
+            terminate(process.pid);
+        }
+    }
+    let application_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < application_deadline
+        && session
+            .processes
+            .iter()
+            .any(|process| process.application && process_matches(process))
+    {
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    for process in session
+        .processes
+        .iter()
+        .rev()
+        .filter(|process| !process.application)
+    {
         if process_matches(process) {
             terminate(process.pid);
         }
@@ -774,12 +810,24 @@ fn wait_until(mut ready: impl FnMut() -> bool) -> std::result::Result<(), ()> {
 /// Starting, describing and ending the agent's display, bound to one store.
 pub struct LinuxSessions {
     store: AgentSessionStore,
+    profiles: desktop_core::SessionProfileStore,
 }
 
 impl LinuxSessions {
     #[must_use]
-    pub const fn new(store: AgentSessionStore) -> Self {
-        Self { store }
+    pub fn new(store: AgentSessionStore) -> Self {
+        Self {
+            store,
+            profiles: desktop_core::SessionProfileStore::at_default_path(),
+        }
+    }
+
+    #[must_use]
+    pub const fn with_stores(
+        store: AgentSessionStore,
+        profiles: desktop_core::SessionProfileStore,
+    ) -> Self {
+        Self { store, profiles }
     }
 
     #[must_use]
@@ -793,8 +841,25 @@ impl SessionHost for LinuxSessions {
         unwatchable_reason().map(Unwatchable::explain)
     }
 
+    fn create(&self, name: &str) -> Result<desktop_core::SessionProfile> {
+        self.profiles.create(name)
+    }
+
+    fn list(&self) -> Result<Vec<desktop_core::SessionProfile>> {
+        self.profiles.list()
+    }
+
+    fn delete(&self, name: &str) -> Result<Option<desktop_core::SessionProfile>> {
+        if current(&self.store).is_some_and(|session| session.name == name) {
+            return Err(DesktopError::invalid_argument(format!(
+                "session {name:?} is running; stop it before deleting its saved logins"
+            )));
+        }
+        self.profiles.delete(name)
+    }
+
     fn start(&self, options: StartOptions) -> Result<AgentSession> {
-        start(options, &self.store)
+        start(options, &self.store, &self.profiles)
     }
 
     fn status(&self) -> Option<AgentSession> {
@@ -806,11 +871,27 @@ impl SessionHost for LinuxSessions {
     }
 
     fn launch(&self, program: &str, args: &[String]) -> Result<u32> {
-        let session = current(&self.store).ok_or_else(|| DesktopError::InvalidArgument {
+        let mut session = current(&self.store).ok_or_else(|| DesktopError::InvalidArgument {
             message: "no agent display is running; start one with `desktop session start`"
                 .to_owned(),
         })?;
-        run(&session, program, args)
+        let pid = run(&session, program, args)?;
+        let name = Path::new(program)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or(program);
+        if let Some(started_at) = start_time(pid) {
+            session.processes.push(
+                SessionProcess::new(name, pid)
+                    .started_at(started_at)
+                    .application(),
+            );
+            if let Err(error) = self.store.save(&session) {
+                terminate(pid);
+                return Err(error);
+            }
+        }
+        Ok(pid)
     }
 }
 
@@ -866,11 +947,14 @@ pub fn display_is_free(number: u32) -> bool {
     !display_socket_path(number).exists() && !display_lock(number).exists()
 }
 
-fn xauthority_path() -> PathBuf {
+fn xauthority_path(name: &str) -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    base.join("desktop-driver").join("Xauthority")
+    base.join("desktop-driver")
+        .join("sessions")
+        .join(name)
+        .join("Xauthority")
 }
 
 fn random_cookie() -> Result<Vec<u8>> {
@@ -976,6 +1060,7 @@ mod tests {
 
     fn session() -> AgentSession {
         AgentSession {
+            name: "default".to_owned(),
             display: ":97".to_owned(),
             width: 1920,
             height: 1080,

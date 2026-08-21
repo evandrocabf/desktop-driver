@@ -204,10 +204,20 @@ fn session(
     sink: &mut Sink<'_>,
 ) -> Result<()> {
     match command {
+        SessionCommand::Create(args) => {
+            let profile = sessions.create(&args.name)?;
+            output::render_session_created(sink, &profile)
+        }
+        SessionCommand::List => {
+            let profiles = sessions.list()?;
+            let running = sessions.status();
+            output::render_session_list(sink, &profiles, running.as_ref())
+        }
         SessionCommand::Start(args) => {
             let (width, height) =
                 crate::cli::parse_size(&args.size).map_err(DesktopError::invalid_argument)?;
             let started = sessions.start(desktop_core::agent::StartOptions {
+                name: args.name.clone(),
                 width,
                 height,
                 display: args.display,
@@ -235,6 +245,10 @@ fn session(
             let stopped = sessions.stop()?;
             store.clear()?;
             output::render_session_stopped(sink, stopped.as_ref())
+        }
+        SessionCommand::Delete(args) => {
+            let deleted = sessions.delete(&args.name)?;
+            output::render_session_deleted(sink, deleted.as_ref(), &args.name)
         }
         SessionCommand::Run(args) => {
             let pid = sessions.launch(&args.program, &args.args)?;
@@ -836,6 +850,21 @@ mod tests {
             fn unwatchable(&self) -> Option<&'static str> {
                 Some("Xephyr is not installed")
             }
+            fn create(
+                &self,
+                _: &str,
+            ) -> desktop_core::errors::Result<desktop_core::SessionProfile> {
+                unreachable!()
+            }
+            fn list(&self) -> desktop_core::errors::Result<Vec<desktop_core::SessionProfile>> {
+                Ok(Vec::new())
+            }
+            fn delete(
+                &self,
+                _: &str,
+            ) -> desktop_core::errors::Result<Option<desktop_core::SessionProfile>> {
+                unreachable!()
+            }
             fn start(
                 &self,
                 _options: desktop_core::agent::StartOptions,
@@ -872,6 +901,59 @@ mod tests {
             &["desktop", "session", "start"],
         );
         assert!(text.contains("window titled"), "got {text}");
+        assert!(text.contains("LOGIN HANDOFF"), "got {text}");
+        assert!(text.contains("Never ask"), "got {text}");
+    }
+
+    #[test]
+    fn creating_a_session_explains_the_credential_safe_visible_handoff() {
+        let (driver, _) = harness("session-create", FakePorts::new());
+        let sessions = FakeSessions::idle();
+        let (category, text) = invoke_with(
+            &driver,
+            &sessions,
+            &["desktop", "session", "create", "github"],
+        );
+        assert_eq!(category, ExitCategory::Success);
+        assert!(text.contains("start github --visible"), "got {text}");
+        assert!(
+            text.contains("must type credentials directly"),
+            "got {text}"
+        );
+        assert_eq!(sessions.list().expect("lists")[0].name, "github");
+    }
+
+    #[test]
+    fn named_sessions_select_distinct_persistent_browser_homes() {
+        let (driver, _) = harness("session-named", FakePorts::new());
+        let sessions = FakeSessions::idle();
+        let (category, _) = invoke_with(
+            &driver,
+            &sessions,
+            &["desktop", "session", "start", "customer-a", "--visible"],
+        );
+        assert_eq!(category, ExitCategory::Success);
+        let running = sessions.status().expect("running");
+        assert_eq!(running.name, "customer-a");
+        assert!(
+            running
+                .home
+                .expect("private home")
+                .ends_with("sessions/customer-a/home")
+        );
+    }
+
+    #[test]
+    fn deleting_a_running_session_is_refused_to_protect_its_profile() {
+        let (driver, _) = harness("session-delete-running", FakePorts::new());
+        let sessions = FakeSessions::running();
+        let (category, text) = invoke_with(
+            &driver,
+            &sessions,
+            &["desktop", "session", "delete", "default"],
+        );
+        assert_eq!(category, ExitCategory::TargetFailure);
+        assert!(text.contains("running"), "got {text}");
     }
 
     #[test]

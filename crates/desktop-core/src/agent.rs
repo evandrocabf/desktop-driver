@@ -62,6 +62,10 @@ pub struct SessionProcess {
     /// `desktop session stop` from signalling something it did not start.
     #[serde(default)]
     pub started_at: u64,
+    /// Whether this is an application launched onto the display rather than
+    /// one of the services that implements the display itself.
+    #[serde(default)]
+    pub application: bool,
 }
 
 impl SessionProcess {
@@ -71,6 +75,7 @@ impl SessionProcess {
             name: name.into(),
             pid,
             started_at: 0,
+            application: false,
         }
     }
 
@@ -79,11 +84,20 @@ impl SessionProcess {
         self.started_at = ticks;
         self
     }
+
+    #[must_use]
+    pub fn application(mut self) -> Self {
+        self.application = true;
+        self
+    }
 }
 
 /// Everything needed to reach the agent's display and the services on it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct AgentSession {
+    /// The persistent browser workspace this runtime belongs to.
+    #[serde(default = "default_session_name")]
+    pub name: String,
     /// The X display name, e.g. `:97`.
     pub display: String,
     pub width: u32,
@@ -272,8 +286,10 @@ impl Unwatchable {
 }
 
 /// What kind of display to build.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartOptions {
+    /// The persistent browser workspace to attach this runtime to.
+    pub name: String,
     pub width: u32,
     pub height: u32,
     /// Use this display number instead of searching for a free one.
@@ -292,6 +308,7 @@ pub struct StartOptions {
 impl Default for StartOptions {
     fn default() -> Self {
         Self {
+            name: default_session_name(),
             width: 1920,
             height: 1080,
             display: None,
@@ -299,6 +316,216 @@ impl Default for StartOptions {
             share_home: false,
         }
     }
+}
+
+/// The backwards-compatible workspace used when no name is supplied.
+#[must_use]
+pub fn default_session_name() -> String {
+    "default".to_owned()
+}
+
+/// Durable identity and browser state, separate from the display runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct SessionProfile {
+    pub name: String,
+    pub home: PathBuf,
+}
+
+/// Persistent browser workspaces.
+///
+/// Runtime credentials and pids never enter this store. They remain under
+/// `XDG_RUNTIME_DIR`; this store contains only the private home in which a
+/// browser keeps cookies, local storage and saved logins.
+#[derive(Clone, Debug)]
+pub struct SessionProfileStore {
+    root: PathBuf,
+}
+
+impl SessionProfileStore {
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    #[must_use]
+    pub fn default_root() -> PathBuf {
+        persistent_data_root().join("sessions")
+    }
+
+    #[must_use]
+    pub fn at_default_path() -> Self {
+        Self::new(Self::default_root())
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn create(&self, name: &str) -> Result<SessionProfile> {
+        validate_session_name(name)?;
+        if self.load(name)?.is_some() {
+            return Err(DesktopError::invalid_argument(format!(
+                "session {name:?} already exists"
+            )));
+        }
+        self.create_new(name)
+    }
+
+    pub fn ensure(&self, name: &str) -> Result<SessionProfile> {
+        validate_session_name(name)?;
+        if let Some(profile) = self.load(name)? {
+            return Ok(profile);
+        }
+        self.create_new(name)
+    }
+
+    pub fn load(&self, name: &str) -> Result<Option<SessionProfile>> {
+        validate_session_name(name)?;
+        let path = self.manifest_path(name);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(DesktopError::internal(format!(
+                    "cannot read {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let profile: SessionProfile = serde_json::from_slice(&bytes).map_err(|error| {
+            DesktopError::internal(format!("cannot decode {}: {error}", path.display()))
+        })?;
+        let expected_home = self.profile_dir(name).join("home");
+        if profile.name != name || profile.home != expected_home {
+            return Err(DesktopError::internal(format!(
+                "{} points outside session {name:?}",
+                path.display()
+            )));
+        }
+        Ok(Some(profile))
+    }
+
+    pub fn list(&self) -> Result<Vec<SessionProfile>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(DesktopError::internal(format!(
+                    "cannot list {}: {error}",
+                    self.root.display()
+                )));
+            }
+        };
+        let mut profiles = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                DesktopError::internal(format!("cannot list {}: {error}", self.root.display()))
+            })?;
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if validate_session_name(&name).is_err() {
+                continue;
+            }
+            if let Some(profile) = self.load(&name)? {
+                profiles.push(profile);
+            }
+        }
+        profiles.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(profiles)
+    }
+
+    pub fn delete(&self, name: &str) -> Result<Option<SessionProfile>> {
+        let Some(profile) = self.load(name)? else {
+            return Ok(None);
+        };
+        let directory = self.profile_dir(name);
+        fs::remove_dir_all(&directory).map_err(|error| {
+            DesktopError::internal(format!("cannot remove {}: {error}", directory.display()))
+        })?;
+        Ok(Some(profile))
+    }
+
+    /// Creates one workspace and migrates the first release's global home
+    /// into `default`, so updating never silently logs an existing user out.
+    fn create_new(&self, name: &str) -> Result<SessionProfile> {
+        let directory = self.profile_dir(name);
+        create_private_dir(&directory)?;
+        let home = directory.join("home");
+
+        let legacy = self.legacy_home();
+        if name == "default" && legacy.exists() && !home.exists() {
+            fs::rename(&legacy, &home).map_err(|error| {
+                DesktopError::internal(format!(
+                    "cannot migrate {} to {}: {error}",
+                    legacy.display(),
+                    home.display()
+                ))
+            })?;
+        }
+        create_private_dir(&home)?;
+
+        let profile = SessionProfile {
+            name: name.to_owned(),
+            home,
+        };
+        let encoded = serde_json::to_vec_pretty(&profile)
+            .map_err(|error| DesktopError::internal(format!("cannot encode session: {error}")))?;
+        let path = self.manifest_path(name);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| {
+                DesktopError::internal(format!("cannot write {}: {error}", path.display()))
+            })?;
+        file.write_all(&encoded)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                DesktopError::internal(format!("cannot write {}: {error}", path.display()))
+            })?;
+        Ok(profile)
+    }
+
+    fn profile_dir(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
+
+    fn manifest_path(&self, name: &str) -> PathBuf {
+        self.profile_dir(name).join("profile.json")
+    }
+
+    fn legacy_home(&self) -> PathBuf {
+        self.root.parent().unwrap_or(&self.root).join("home")
+    }
+}
+
+/// Session names become directory names, so accept a deliberately small set.
+pub fn validate_session_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'-' | b'_'))
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(DesktopError::invalid_argument(
+            "a session name must be 1-64 ASCII letters or digits, with '-' and '_' allowed after the first character",
+        ))
+    }
+}
+
+fn persistent_data_root() -> PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("desktop-driver")
 }
 
 /// Creates a directory only its owner can enter.
@@ -324,13 +551,9 @@ pub fn create_private_dir(path: &Path) -> Result<()> {
 /// tomorrow, the same as the user's own profile would be.
 #[must_use]
 pub fn default_agent_home() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("desktop-driver").join("home")
+    SessionProfileStore::default_root()
+        .join("default")
+        .join("home")
 }
 
 /// Where the current session record is kept.
@@ -443,6 +666,12 @@ pub trait SessionHost {
         None
     }
 
+    fn create(&self, name: &str) -> Result<SessionProfile>;
+
+    fn list(&self) -> Result<Vec<SessionProfile>>;
+
+    fn delete(&self, name: &str) -> Result<Option<SessionProfile>>;
+
     fn start(&self, options: StartOptions) -> Result<AgentSession>;
 
     /// The running session, or `None`.
@@ -496,6 +725,18 @@ impl SessionHost for NoSessionHost {
         false
     }
 
+    fn create(&self, _name: &str) -> Result<SessionProfile> {
+        self.refuse()
+    }
+
+    fn list(&self) -> Result<Vec<SessionProfile>> {
+        self.refuse()
+    }
+
+    fn delete(&self, _name: &str) -> Result<Option<SessionProfile>> {
+        self.refuse()
+    }
+
     fn start(&self, _options: StartOptions) -> Result<AgentSession> {
         self.refuse()
     }
@@ -543,6 +784,7 @@ mod tests {
 
     fn session() -> AgentSession {
         AgentSession {
+            name: "default".to_owned(),
             display: ":97".to_owned(),
             width: 1920,
             height: 1080,
@@ -563,6 +805,103 @@ mod tests {
         let store = AgentSessionStore::new(path);
         let _ = store.clear();
         store
+    }
+
+    fn temp_profiles(tag: &str) -> SessionProfileStore {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "desktop-driver-profiles-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        SessionProfileStore::new(root.join("sessions"))
+    }
+
+    #[test]
+    fn named_sessions_keep_browser_homes_separate_and_persistent() {
+        let store = temp_profiles("isolated");
+        let github = store.create("github").expect("creates github");
+        let customer = store.create("customer-a").expect("creates customer");
+
+        assert_ne!(github.home, customer.home);
+        assert!(github.home.is_dir());
+        assert_eq!(store.ensure("github").expect("reloads"), github);
+        assert_eq!(store.list().expect("lists"), vec![customer, github]);
+
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn the_legacy_global_home_becomes_default_without_losing_login_state() {
+        let store = temp_profiles("legacy");
+        let legacy = store.legacy_home();
+        create_private_dir(&legacy).expect("creates legacy home");
+        fs::write(legacy.join("cookie"), b"still-signed-in").expect("writes login state");
+
+        let profile = store.ensure("default").expect("migrates");
+
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read(profile.home.join("cookie")).expect("preserved"),
+            b"still-signed-in"
+        );
+        let _ = fs::remove_dir_all(store.root().parent().expect("has data root"));
+    }
+
+    #[test]
+    fn a_profile_and_its_home_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let store = temp_profiles("permissions");
+        let profile = store.create("bank").expect("creates");
+        let home_mode = fs::metadata(&profile.home)
+            .expect("home exists")
+            .permissions()
+            .mode();
+        let manifest_mode = fs::metadata(store.manifest_path("bank"))
+            .expect("manifest exists")
+            .permissions()
+            .mode();
+        assert_eq!(home_mode & 0o777, 0o700);
+        assert_eq!(manifest_mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_saved_browser_state() {
+        let store = temp_profiles("delete");
+        let profile = store.create("temporary").expect("creates");
+        fs::write(profile.home.join("cookie"), b"secret").expect("writes state");
+
+        assert_eq!(
+            store.delete("temporary").expect("deletes"),
+            Some(profile.clone())
+        );
+        assert!(!profile.home.exists());
+        assert_eq!(store.delete("temporary").expect("already gone"), None);
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn session_names_cannot_escape_the_profile_root() {
+        let store = temp_profiles("names");
+        for name in ["", ".hidden", "../host", "a/b", "two words"] {
+            assert!(store.create(name).is_err(), "{name:?} must be refused");
+        }
+        assert!(!store.root().exists());
+    }
+
+    #[test]
+    fn a_tampered_manifest_cannot_redirect_the_browser_home() {
+        let store = temp_profiles("tampered");
+        store.create("github").expect("creates");
+        fs::write(
+            store.manifest_path("github"),
+            br#"{"name":"github","home":"/tmp/not-this-session"}"#,
+        )
+        .expect("tampers");
+
+        assert!(store.load("github").is_err());
+        let _ = fs::remove_dir_all(store.root());
     }
 
     #[test]

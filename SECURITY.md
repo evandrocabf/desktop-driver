@@ -49,9 +49,9 @@ can no longer find at least two such paths, so the gate cannot quietly stop chec
 | screenshots (default) | `$XDG_RUNTIME_DIR/desktop-driver/` | `0600` |
 | snapshots | `$XDG_RUNTIME_DIR/desktop-driver/snapshot.json` | `0600` |
 | session record, incl. the display cookie | `$XDG_RUNTIME_DIR/desktop-driver/` | `0600` |
-| the agent display's `Xauthority` | `$XDG_RUNTIME_DIR/desktop-driver/` | `0600` |
+| the agent display's `Xauthority` | `$XDG_RUNTIME_DIR/desktop-driver/sessions/<name>/` | `0600` |
 | portal restore token | `$XDG_STATE_HOME/desktop-driver/` | `0600` |
-| the agent's home directory | `$XDG_DATA_HOME/desktop-driver/home` | `0700` |
+| named browser homes | `$XDG_DATA_HOME/desktop-driver/sessions/<name>/home` | `0700` |
 
 Where there is no runtime directory — a container, a cron job, a login without systemd — the first
 four fall back to the shared temporary directory, which is world-writable. The files are owner-only
