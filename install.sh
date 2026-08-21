@@ -286,6 +286,17 @@ default_src_dir() {
 
 resolve_source() {
   local self script_dir
+  # bootstrap_update runs from a temporary copy, so BASH_SOURCE no longer
+  # identifies the checkout the user invoked. Carry its classification across
+  # that boundary: a Git checkout must still install its exact source after it
+  # is pulled, rather than becoming eligible for a same-version release asset.
+  if [ "${DESKTOP_DRIVER_UPDATE_SOURCE_MODE:-}" = "local" ] &&
+     [ "${DESKTOP_DRIVER_UPDATE_BOOTSTRAPPED:-0}" -eq 1 ] &&
+     [ -n "$SRC_DIR_ARG" ]; then
+    SRC="$SRC_DIR_ARG"
+    SRC_MODE="local"
+    return
+  fi
   # Empty when piped through `curl | bash`, which is exactly when we must clone.
   self="${BASH_SOURCE[0]:-}"
   if [ -n "$self" ] && [ -f "$self" ]; then
@@ -305,7 +316,7 @@ resolve_source() {
 # from a temporary copy that is outside the checkout. The original checkout
 # path is passed explicitly because the temporary script is not in a source tree.
 bootstrap_update() {
-  local self script_dir tmp status
+  local self script_dir tmp status source_mode
   [ "$UPDATE" -eq 1 ] || return 0
   [ "${DESKTOP_DRIVER_UPDATE_BOOTSTRAPPED:-0}" -eq 0 ] || return 0
   self="${BASH_SOURCE[0]:-}"
@@ -316,8 +327,14 @@ bootstrap_update() {
   tmp="$(mktemp /tmp/desktop-driver-update.XXXXXX)"
   cp "$self" "$tmp"
   chmod 700 "$tmp"
+  source_mode="clone"
+  if [ -z "$SRC_DIR_ARG" ] && [ -d "$script_dir/.git" ]; then
+    source_mode="local"
+  fi
   if [ -z "$SRC_DIR_ARG" ]; then
-    if DESKTOP_DRIVER_UPDATE_BOOTSTRAPPED=1 bash "$tmp" "${ORIGINAL_ARGS[@]}" --src "$script_dir"; then
+    if DESKTOP_DRIVER_UPDATE_BOOTSTRAPPED=1 \
+       DESKTOP_DRIVER_UPDATE_SOURCE_MODE="$source_mode" \
+       bash "$tmp" "${ORIGINAL_ARGS[@]}" --src "$script_dir"; then
       status=0
     else
       status=$?
@@ -365,7 +382,7 @@ fetch_tarball() {
     info "${DIM}git is not installed, so this is a tarball rather than a clone${R}"
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    info "${DIM}would: curl -fsSL $url | tar -xz -C $SRC${R}"
+    info "${DIM}would: replace $SRC with the source from $url, preserving target/${R}"
     return
   fi
 
@@ -384,16 +401,48 @@ fetch_tarball() {
     scrub "$tmp" "the downloaded archive is not a desktop-driver source tree"
 
   if is_checkout "$SRC"; then
-    # Copied over rather than swapped in: target/ holds the last build, which
-    # is minutes of compiling and is not in the archive. Deleting the tree to
-    # replace it would throw that away on every update.
-    cp -R "$root/." "$SRC/"
+    replace_tarball_checkout "$root"
   else
     mkdir -p "$(dirname "$SRC")"
     mv "$root" "$SRC"
   fi
   rm -rf "$tmp"
   did "unpacked into $SRC"
+}
+
+# Replace a tarball checkout as a tree instead of copying the new archive over
+# it. Overlaying cannot remove files deleted upstream, which leaves linked and
+# copied skills exposing obsolete resources. The build cache is the sole local
+# directory retained; both staging directories live beside SRC so the final
+# swaps are filesystem-local renames.
+replace_tarball_checkout() {
+  local root="$1" parent stage backup
+  parent="$(dirname "$SRC")"
+  stage="$(mktemp -d "$parent/.desktop-driver-new.XXXXXX")"
+  backup="$(mktemp -d "$parent/.desktop-driver-old.XXXXXX")"
+  rmdir "$backup"
+
+  cp -R "$root/." "$stage/" || scrub "$stage" "cannot stage the downloaded source"
+  if ! mv "$SRC" "$backup"; then
+    scrub "$stage" "cannot move the existing checkout aside"
+  fi
+
+  if [ -d "$backup/target" ]; then
+    rm -rf "$stage/target"
+    if ! mv "$backup/target" "$stage/target"; then
+      mv "$backup" "$SRC" 2>/dev/null || true
+      scrub "$stage" "cannot preserve the existing build cache"
+    fi
+  fi
+
+  if ! mv "$stage" "$SRC"; then
+    if [ -d "$stage/target" ]; then
+      mv "$stage/target" "$backup/target" 2>/dev/null || true
+    fi
+    mv "$backup" "$SRC" 2>/dev/null || true
+    scrub "$stage" "cannot replace the existing tarball checkout"
+  fi
+  rm -rf "$backup"
 }
 
 # The source, by whichever route this machine supports.
@@ -965,7 +1014,7 @@ fi
 bootstrap_update
 resolve_source
 
-if [ "$UNINSTALL" -eq 0 ] && [ "$SRC_MODE" = "clone" ]; then
+if [ "$UNINSTALL" -eq 0 ] && { [ "$SRC_MODE" = "clone" ] || [ "$UPDATE" -eq 1 ]; }; then
   clone_or_update
 fi
 
