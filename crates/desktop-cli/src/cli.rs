@@ -111,7 +111,7 @@ pub enum Command {
     #[command(subcommand)]
     Session(SessionCommand),
 
-    /// Navigate and automate Chromium with browser-native semantics.
+    /// Navigate and automate Chromium or Firefox with browser-native semantics.
     #[command(subcommand)]
     Browser(BrowserCommand),
 
@@ -134,7 +134,7 @@ pub enum BrowserCommand {
     Doctor(BrowserProfileArgs),
     /// Start a managed browser and optionally navigate.
     Open(BrowserOpenArgs),
-    /// Attach to an existing loopback CDP HTTP or WebSocket endpoint.
+    /// Attach to an existing loopback CDP or WebDriver BiDi endpoint.
     Connect(BrowserConnectArgs),
     /// Show managed browser state.
     Status(BrowserProfileArgs),
@@ -198,6 +198,9 @@ pub struct BrowserOpenArgs {
     pub profile: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub executable: Option<String>,
+    /// Browser engine to automate.
+    #[arg(long, value_enum)]
+    pub browser: Option<BrowserEngineArg>,
     /// Run without a watchable browser window.
     #[arg(long)]
     pub headless: bool,
@@ -208,6 +211,16 @@ pub struct BrowserConnectArgs {
     pub endpoint: String,
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
+    /// Protocol exposed by the endpoint.
+    #[arg(long, value_enum)]
+    pub browser: Option<BrowserEngineArg>,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum BrowserEngineArg {
+    #[default]
+    Chromium,
+    Firefox,
 }
 
 #[derive(Debug, Args)]
@@ -298,9 +311,9 @@ pub struct BrowserSelectArgs {
 pub struct BrowserScrollArgs {
     #[command(flatten)]
     pub selector: BrowserTargetArgs,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0)]
     pub x: i64,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0)]
     pub y: i64,
 }
 
@@ -680,8 +693,31 @@ mod tests {
     }
 
     #[test]
+    fn browser_engine_is_optional_but_explicit_firefox_is_preserved() {
+        let omitted = Cli::try_parse_from(["desktop", "browser", "open", "example.com"]).unwrap();
+        let Command::Browser(BrowserCommand::Open(omitted)) = omitted.command else {
+            panic!("expected browser open")
+        };
+        assert!(omitted.browser.is_none());
+
+        let explicit = Cli::try_parse_from([
+            "desktop",
+            "browser",
+            "open",
+            "example.com",
+            "--browser",
+            "firefox",
+        ])
+        .unwrap();
+        let Command::Browser(BrowserCommand::Open(explicit)) = explicit.command else {
+            panic!("expected browser open")
+        };
+        assert!(matches!(explicit.browser, Some(BrowserEngineArg::Firefox)));
+    }
+
+    #[test]
     fn the_documented_example_invocations_all_parse() {
-        // These are the exact forms promised in the README and --help.
+        // These are exact forms promised in the README, installed skill and --help.
         let examples: &[&[&str]] = &[
             &["desktop", "apps"],
             &["desktop", "windows"],
@@ -730,6 +766,15 @@ mod tests {
                 "https://example.com",
                 "--headless",
             ],
+            &[
+                "desktop",
+                "browser",
+                "open",
+                "https://example.com",
+                "--browser",
+                "firefox",
+                "--headless",
+            ],
             &["desktop", "browser", "snapshot", "-i"],
             &["desktop", "browser", "fill", "@e2", "value"],
             &["desktop", "browser", "click", "@e3"],
@@ -741,6 +786,101 @@ mod tests {
             &["desktop", "browser", "download", "@e8", "--output", "/tmp"],
             &["desktop", "browser", "tab", "new", "https://example.com"],
             &["desktop", "browser", "dialog", "dismiss"],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "status",
+                "--profile",
+                "research",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "goto",
+                "https://example.com/form",
+                "--timeout",
+                "30000",
+            ],
+            &["desktop", "--json", "browser", "snapshot", "--interactive"],
+            &["desktop", "--json", "browser", "press", "Enter", "@e2"],
+            &[
+                "desktop", "--json", "browser", "type", "@e2", "value", "--delay", "25",
+            ],
+            &[
+                "desktop", "--json", "browser", "select", "@e5", "one", "two",
+            ],
+            &["desktop", "--json", "browser", "scroll", "--y", "-500"],
+            &[
+                "desktop", "--json", "browser", "get", "attr", "css=a", "href",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "get",
+                "text",
+                "--label",
+                "Email address",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "wait",
+                "css=.spinner",
+                "--hidden",
+                "--timeout",
+                "10000",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "wait",
+                "--url",
+                "/complete",
+                "--timeout",
+                "10000",
+            ],
+            &["desktop", "--json", "browser", "tab", "use", "2"],
+            &["desktop", "--json", "browser", "tab", "close"],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "dialog",
+                "accept",
+                "--prompt-text",
+                "value",
+            ],
+            &["desktop", "--json", "session", "list"],
+            &["desktop", "--json", "session", "create", "task-name"],
+            &[
+                "desktop",
+                "--json",
+                "session",
+                "start",
+                "task-name",
+                "--visible",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "session",
+                "run",
+                "firefox",
+                "https://example.com",
+            ],
+            &[
+                "desktop",
+                "--no-steal-focus",
+                "--json",
+                "snapshot",
+                "--app",
+                "Calculator",
+            ],
         ];
         for argv in examples {
             Cli::try_parse_from(*argv)

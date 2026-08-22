@@ -10,8 +10,8 @@
 #
 #   1. puts the `desktop` binary on your PATH — a released build for this
 #      platform where there is one, otherwise built from source;
-#   2. links skills/desktop-driver/ into wherever your coding agents look for
-#      skills.
+#   2. installs skills/desktop-driver/ wherever coding agents look for skills;
+#      agents without a directory skill loader receive one flattened file.
 #
 # Piped through `curl | bash` it needs curl and tar and nothing else: the source
 # arrives as a tarball when git is absent, and the binary is downloaded rather
@@ -903,18 +903,21 @@ install_skill_file() {
   fi
 
   act mkdir -p "$(dirname "$target")"
-  if [ "$COPY" -eq 1 ]; then
-    act cp "$src" "$target"
-    # The trailing comment is what --uninstall recognises later; it is inert
-    # markdown, so it changes nothing for the agent reading the file.
-    if [ "$DRY_RUN" -eq 0 ]; then
-      printf '\n<!-- %s: from %s -->\n' "$MARKER" "$SRC" >>"$target"
-    fi
-    did "$target ${DIM}(copied)${R}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "${DIM}would: flatten $SRC/skills/$SKILL_NAME into $target${R}"
   else
-    act ln -s "$src" "$target"
-    did "$target ${DIM}→ $src${R}"
+    {
+      cat "$src"
+      for reference in "$SRC/skills/$SKILL_NAME"/references/*.md; do
+        [ -f "$reference" ] || continue
+        printf '\n---\n\n# Bundled reference: %s\n\n' "$(basename "$reference")"
+        cat "$reference"
+      done
+      # This inert marker lets --uninstall distinguish our generated file.
+      printf '\n<!-- %s: from %s -->\n' "$MARKER" "$SRC"
+    } >"$target"
   fi
+  did "$target ${DIM}(flattened)${R}"
 }
 
 uninstall_skill() {
@@ -1111,7 +1114,7 @@ info "Verify:   desktop doctor"
 info "Try it:   desktop apps && desktop snapshot --app <something you have open>"
 info "Browser:  desktop browser doctor && desktop browser open https://example.com --headless"
 if [ "$(uname -s)" != "Darwin" ]; then
-  info "Session:  desktop session create NAME && desktop session start NAME --visible"
+  info "Session:  desktop session start NAME --visible"
 fi
 if [ -d "$SRC/.git" ]; then
   info "Update:   $SRC/install.sh --update"

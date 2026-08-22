@@ -46,9 +46,11 @@ pub enum Command {
         url: Option<String>,
         executable: Option<String>,
         headless: bool,
+        engine: BrowserEngine,
     },
     Connect {
         endpoint: String,
+        engine: BrowserEngine,
     },
     Status,
     Close,
@@ -136,6 +138,23 @@ pub enum Command {
         accept: bool,
         prompt_text: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserEngine {
+    #[default]
+    Chromium,
+    Firefox,
+}
+
+impl BrowserEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chromium => "chromium",
+            Self::Firefox => "firefox",
+        }
+    }
 }
 
 impl Command {

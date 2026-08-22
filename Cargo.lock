@@ -412,6 +412,7 @@ version = "0.2.0"
 dependencies = [
  "base64",
  "ctrlc",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

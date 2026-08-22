@@ -15,9 +15,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 
 use crate::{
-    BrowserError, BrowserResult, Command, GetKind, LoadState, Request, Response, Selector,
-    cdp::{Browser, js_string, snapshot_script},
-    paths::{browser_executable, profile_paths},
+    BrowserEngine, BrowserError, BrowserResult, Command, GetKind, LoadState, Request, Response,
+    Selector,
+    backend::Browser,
+    cdp::{js_string, snapshot_script},
+    paths::{browser_executable, profile_paths, save_profile_engine},
 };
 
 #[derive(Clone, Debug)]
@@ -191,14 +193,13 @@ impl State {
     fn response(&mut self, result: Value) -> Response {
         let mut response = Response::success(&self.profile, result);
         if let Some(browser) = self.browser.as_mut() {
-            response.tab_id = Some(browser.target_id.clone());
-            response.document_id = Some(browser.document_id);
+            response.tab_id = Some(browser.target_id().to_owned());
+            response.document_id = Some(browser.document_id());
             // Runtime is suspended while alert/confirm/prompt is open. Asking
             // for location here would block the response that tells the next
             // CLI invocation it may handle the dialog.
-            if browser.suppress_url_once {
-                browser.suppress_url_once = false;
-            } else if !browser.dialog_open {
+            if browser.take_suppress_url() {
+            } else if !browser.dialog_open() {
                 response.url = browser.url().ok();
             }
         }
@@ -216,35 +217,54 @@ impl State {
                 url,
                 executable,
                 headless,
+                engine,
             } => {
                 if let Some(browser) = self.browser.as_ref() {
-                    validate_open_mode(browser.child.is_some(), self.headless_owned, headless)?;
+                    validate_open(browser, self.headless_owned, headless, engine)?;
+                    // Repair profiles created before engine markers existed,
+                    // using the live daemon as the source of truth.
+                    save_profile_engine(&self.profile, engine)?;
                 } else {
                     let paths = profile_paths(&self.profile)?;
-                    let executable = browser_executable(executable.as_deref())?;
-                    self.browser = Some(Browser::launch(&executable, &paths.user_data, headless)?);
+                    let executable = browser_executable(engine, executable.as_deref())?;
+                    let profile = match engine {
+                        BrowserEngine::Chromium => &paths.user_data,
+                        BrowserEngine::Firefox => &paths.firefox_user_data,
+                    };
+                    let browser = Browser::launch(engine, &executable, profile, headless)?;
+                    if let Err(error) = save_profile_engine(&self.profile, engine) {
+                        drop(browser);
+                        return Err(error);
+                    }
+                    self.browser = Some(browser);
                     self.headless_owned = headless;
                 }
                 if let Some(url) = url {
                     navigate(self.browser()?, &url, 30_000)?;
                 }
-                Ok(json!({"opened":true,"headless":self.headless_owned}))
+                Ok(json!({"opened":true,"headless":self.headless_owned,"browser":engine.as_str()}))
             }
-            Command::Connect { endpoint } => {
+            Command::Connect { endpoint, engine } => {
                 if self.browser.is_some() {
                     return Err(BrowserError::new(
                         "browser_already_running",
                         "close the current browser before connecting",
                     ));
                 }
-                self.browser = Some(Browser::connect(&endpoint)?);
+                let browser = Browser::connect(engine, &endpoint)?;
+                if let Err(error) = save_profile_engine(&self.profile, engine) {
+                    drop(browser);
+                    return Err(error);
+                }
+                self.browser = Some(browser);
                 self.headless_owned = false;
                 Ok(json!({"connected":true,"owned":false}))
             }
             Command::Status => Ok(json!({
                 "running":self.browser.is_some(),
-                "owned":self.browser.as_ref().is_some_and(|browser| browser.child.is_some()),
-                "headless":self.browser.as_ref().and_then(|browser| browser.child.as_ref().map(|_| self.headless_owned)),
+                "owned":self.browser.as_ref().is_some_and(Browser::owned),
+                "headless":self.browser.as_ref().and_then(|browser| browser.owned().then_some(self.headless_owned)),
+                "browser":self.browser.as_ref().map(|browser|browser.engine().as_str()),
             })),
             Command::Close => {
                 self.browser.take();
@@ -267,7 +287,7 @@ impl State {
                 let b = self.browser()?;
                 let previous_loader = b.current_loader_id()?;
                 b.call("Page.reload", json!({}))?;
-                b.document_id += 1;
+                b.bump_document();
                 wait_for_new_loader(b, &previous_loader, timeout_ms)?;
                 Ok(json!({"reloaded":true}))
             }
@@ -345,7 +365,7 @@ impl State {
                 )?;
                 let id = result["targetId"].as_str().unwrap_or_default().to_owned();
                 b.attach(&id)?;
-                b.document_id += 1;
+                b.bump_document();
                 Ok(json!({"created":id}))
             }
             Command::TabUse { target } => {
@@ -354,7 +374,7 @@ impl State {
                 let id = resolve_tab(&tabs, &target)?;
                 b.call_browser("Target.activateTarget", json!({"targetId":id}))?;
                 b.attach(&id)?;
-                b.document_id += 1;
+                b.bump_document();
                 Ok(json!({"active":id}))
             }
             Command::TabClose { target } => {
@@ -362,12 +382,12 @@ impl State {
                 let id = if let Some(target) = target {
                     resolve_tab(&b.tabs()?, &target)?
                 } else {
-                    b.target_id.clone()
+                    b.target_id().to_owned()
                 };
                 b.call_browser("Target.closeTarget", json!({"targetId":id}))?;
-                if id == b.target_id {
+                if id == b.target_id() {
                     b.attach_first_available()?;
-                    b.document_id += 1;
+                    b.bump_document();
                 }
                 Ok(json!({"closed":id}))
             }
@@ -381,11 +401,28 @@ impl State {
                     params["promptText"] = json!(prompt_text);
                 }
                 b.call("Page.handleJavaScriptDialog", params)?;
-                b.dialog_open = false;
+                b.set_dialog_open(false);
                 Ok(json!({"handled":true,"accepted":accept}))
             }
         }
     }
+}
+
+fn validate_open(
+    browser: &Browser,
+    actual_headless: bool,
+    requested_headless: bool,
+    requested_engine: BrowserEngine,
+) -> BrowserResult<()> {
+    validate_open_mode(browser.owned(), actual_headless, requested_headless)?;
+    if browser.engine() != requested_engine {
+        return Err(BrowserError::new(
+            "browser_engine_mismatch",
+            format!("profile is already running {}", browser.engine().as_str()),
+        )
+        .remedy("Close the profile before changing its browser engine."));
+    }
+    Ok(())
 }
 
 fn validate_open_mode(
@@ -416,25 +453,13 @@ fn validate_open_mode(
     Ok(())
 }
 
-impl Browser {
-    fn attach_first_available(&mut self) -> BrowserResult<()> {
-        let tabs = self.tabs()?;
-        let id = tabs
-            .first()
-            .and_then(|t| t["targetId"].as_str())
-            .ok_or_else(|| BrowserError::new("tab_gone", "no tabs remain"))?
-            .to_owned();
-        self.attach(&id)
-    }
-}
-
 fn navigate(browser: &mut Browser, url: &str, timeout: u64) -> BrowserResult<()> {
     let url = normalize_url(url)?;
     let result = browser.call("Page.navigate", json!({"url":url}))?;
     if let Some(error) = result["errorText"].as_str() {
         return Err(BrowserError::new("navigation_failed", error));
     }
-    browser.document_id += 1;
+    browser.bump_document();
     if let Some(loader_id) = result["loaderId"].as_str() {
         browser.wait_for_loader(loader_id, timeout)
     } else {
@@ -464,7 +489,7 @@ fn normalize_url(url: &str) -> BrowserResult<String> {
 fn history(browser: &mut Browser, delta: i32, timeout: u64) -> BrowserResult<()> {
     let previous_url = browser.url()?;
     browser.evaluate(&format!("history.go({delta})"))?;
-    browser.document_id += 1;
+    browser.bump_document();
     let deadline = Instant::now() + Duration::from_millis(timeout);
     loop {
         if browser.url()? != previous_url {
@@ -545,7 +570,7 @@ fn action(browser: &mut Browser, selector: &Selector, action: Action) -> Browser
             "Input.dispatchMouseEvent",
             json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1}),
         )?;
-        browser.suppress_url_once = true;
+        browser.set_suppress_url();
         return Ok(json!({"clicked":true}));
     }
     Ok(result)

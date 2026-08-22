@@ -1,12 +1,17 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
-use crate::{BrowserError, BrowserResult};
+use crate::{BrowserEngine, BrowserError, BrowserResult};
 
 #[derive(Clone, Debug)]
 pub struct ProfilePaths {
     pub socket: PathBuf,
     pub user_data: PathBuf,
+    pub firefox_user_data: PathBuf,
     pub downloads: PathBuf,
+    pub engine_file: PathBuf,
 }
 
 pub fn profile_name(explicit: Option<&str>, active: Option<&str>) -> BrowserResult<String> {
@@ -53,25 +58,92 @@ pub fn profile_paths(profile: &str) -> BrowserResult<ProfilePaths> {
                 .and_then(Path::file_name)
                 .is_some_and(|name| name == "sessions")
     });
-    let base = if inside_matching_session {
-        inherited_home
-            .unwrap()
-            .join(".config/desktop-driver/chromium")
+    let browser_root = if inside_matching_session {
+        inherited_home.unwrap().join(".config/desktop-driver")
     } else {
         data.join("desktop-driver/sessions")
             .join(profile)
-            .join("home/.config/desktop-driver/chromium")
+            .join("home/.config/desktop-driver")
     };
+    let base = browser_root.join("chromium");
     Ok(ProfilePaths {
         socket: runtime
             .join("desktop-driver/browser")
             .join(format!("{profile}.sock")),
         downloads: base.join("Downloads"),
         user_data: base,
+        firefox_user_data: browser_root.join("firefox"),
+        engine_file: browser_root.join("engine"),
     })
 }
 
-pub fn browser_executable(explicit: Option<&str>) -> BrowserResult<PathBuf> {
+pub fn profile_engine(profile: &str) -> BrowserResult<Option<BrowserEngine>> {
+    let paths = profile_paths(profile)?;
+    profile_engine_from_paths(profile, &paths)
+}
+
+fn profile_engine_from_paths(
+    profile: &str,
+    paths: &ProfilePaths,
+) -> BrowserResult<Option<BrowserEngine>> {
+    if paths.engine_file.is_file() {
+        let value = std::fs::read_to_string(&paths.engine_file).map_err(io_error)?;
+        return match value.trim() {
+            "chromium" => Ok(Some(BrowserEngine::Chromium)),
+            "firefox" => Ok(Some(BrowserEngine::Firefox)),
+            value => Err(BrowserError::new(
+                "invalid_profile_engine",
+                format!("browser profile {profile:?} has invalid engine marker {value:?}"),
+            )
+            .remedy("Pass --browser chromium or --browser firefox to repair the profile.")),
+        };
+    }
+
+    // Profiles created before the marker was introduced can still be
+    // recovered without making the agent repeat its original engine choice.
+    match (paths.user_data.is_dir(), paths.firefox_user_data.is_dir()) {
+        (false, true) => Ok(Some(BrowserEngine::Firefox)),
+        (true, false) => Ok(Some(BrowserEngine::Chromium)),
+        _ => Ok(None),
+    }
+}
+
+pub fn save_profile_engine(profile: &str, engine: BrowserEngine) -> BrowserResult<()> {
+    let path = profile_paths(profile)?.engine_file;
+    save_engine_file(&path, engine)
+}
+
+fn save_engine_file(path: &Path, engine: BrowserEngine) -> BrowserResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| BrowserError::new("browser_io", "invalid engine marker path"))?;
+    std::fs::create_dir_all(parent).map_err(io_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(io_error)?;
+        let temporary = parent.join(format!(".engine-{}.tmp", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(io_error)?;
+        file.write_all(engine.as_str().as_bytes())
+            .map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .map_err(io_error)?;
+        std::fs::rename(&temporary, path).map_err(io_error)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&path, engine.as_str()).map_err(io_error)?;
+    Ok(())
+}
+
+pub fn browser_executable(engine: BrowserEngine, explicit: Option<&str>) -> BrowserResult<PathBuf> {
     if let Some(path) = explicit {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -82,20 +154,29 @@ pub fn browser_executable(explicit: Option<&str>) -> BrowserResult<PathBuf> {
             format!("browser executable does not exist: {}", path.display()),
         ));
     }
-    let installed = installed_browser_path();
-    if installed.is_file() {
-        return Ok(installed);
+    if engine == BrowserEngine::Chromium {
+        let installed = installed_browser_path();
+        if installed.is_file() {
+            return Ok(installed);
+        }
     }
-    for name in browser_names() {
+    for name in browser_names(engine) {
         if let Some(path) = find_in_path(name) {
             return Ok(path);
         }
     }
     Err(BrowserError::new(
         "browser_not_found",
-        "no compatible Chromium browser was found",
+        format!("no compatible {} browser was found", engine.as_str()),
     )
-    .remedy("Install Chrome/Chromium, pass --executable, or run `desktop browser install`."))
+    .remedy(match engine {
+        BrowserEngine::Chromium => {
+            "Install Chrome/Chromium, pass --executable, or run `desktop browser install`."
+        }
+        BrowserEngine::Firefox => {
+            "Install Firefox or pass --executable to `desktop browser open --browser firefox`."
+        }
+    }))
 }
 
 pub fn installed_browser_path() -> PathBuf {
@@ -111,22 +192,28 @@ pub fn installed_browser_path() -> PathBuf {
     data.join("desktop-driver/browsers/chrome-for-testing/chrome-linux64/chrome")
 }
 
-fn browser_names() -> &'static [&'static str] {
+fn browser_names(engine: BrowserEngine) -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
     {
-        &[
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
+        match engine {
+            BrowserEngine::Chromium => &[
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ],
+            BrowserEngine::Firefox => &["/Applications/Firefox.app/Contents/MacOS/firefox"],
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        &[
-            "google-chrome",
-            "google-chrome-stable",
-            "chromium",
-            "chromium-browser",
-        ]
+        match engine {
+            BrowserEngine::Chromium => &[
+                "google-chrome",
+                "google-chrome-stable",
+                "chromium",
+                "chromium-browser",
+            ],
+            BrowserEngine::Firefox => &["firefox", "firefox-esr"],
+        }
     }
 }
 
@@ -141,6 +228,10 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         .map(Path::new)
         .map(|p| p.join(name))
         .find(|p| p.is_file())
+}
+
+fn io_error(error: std::io::Error) -> BrowserError {
+    BrowserError::new("browser_io", error.to_string())
 }
 
 #[cfg(test)]
@@ -162,5 +253,40 @@ mod tests {
     fn active_session_is_the_default_profile() {
         assert_eq!(profile_name(None, Some("work")).unwrap(), "work");
         assert_eq!(profile_name(None, None).unwrap(), "default");
+    }
+
+    #[test]
+    fn firefox_and_chromium_profiles_do_not_share_browser_state() {
+        let paths = profile_paths("engine-isolation").unwrap();
+        assert_ne!(paths.user_data, paths.firefox_user_data);
+        assert!(paths.user_data.ends_with("chromium"));
+        assert!(paths.firefox_user_data.ends_with("firefox"));
+    }
+
+    #[test]
+    fn a_saved_engine_wins_and_legacy_firefox_profiles_are_inferred() {
+        let root = std::env::temp_dir().join(format!(
+            "desktop-browser-engine-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = ProfilePaths {
+            socket: root.join("browser.sock"),
+            user_data: root.join("chromium"),
+            firefox_user_data: root.join("firefox"),
+            downloads: root.join("downloads"),
+            engine_file: root.join("engine"),
+        };
+        std::fs::create_dir_all(&paths.firefox_user_data).unwrap();
+        assert_eq!(
+            profile_engine_from_paths("test", &paths).unwrap(),
+            Some(BrowserEngine::Firefox)
+        );
+        save_engine_file(&paths.engine_file, BrowserEngine::Chromium).unwrap();
+        assert_eq!(
+            profile_engine_from_paths("test", &paths).unwrap(),
+            Some(BrowserEngine::Chromium)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
