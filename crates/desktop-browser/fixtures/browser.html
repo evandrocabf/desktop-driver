@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>desktop browser fixture</title></head>
+<body>
+  <h1>Browser fixture</h1>
+  <form id="profile">
+    <label>Name <input id="name" data-testid="name" autocomplete="off"></label>
+    <label>Password <input id="password" type="password"></label>
+    <label>Plan
+      <select id="plan"><option value="free">Free</option><option value="pro">Pro</option></select>
+    </label>
+    <label><input id="terms" type="checkbox"> Accept terms</label>
+    <button id="save" type="submit">Save</button>
+  </form>
+  <p id="result">Idle</p>
+  <button id="dialog" type="button">Open dialog</button>
+  <a id="download" href="data:text/plain,desktop-driver" download="fixture.txt">Download file</a>
+  <div id="shadow-host"></div>
+  <iframe id="child" title="Child frame" srcdoc="<button id='inside-frame'>Inside frame</button>"></iframe>
+  <script>
+    document.querySelector('#profile').addEventListener('submit', event => {
+      event.preventDefault();
+      document.querySelector('#result').textContent = `Saved ${document.querySelector('#name').value}`;
+      history.pushState({}, '', '#saved');
+    });
+    document.querySelector('#dialog').addEventListener('click', () => alert('Fixture dialog'));
+    const root = document.querySelector('#shadow-host').attachShadow({mode: 'open'});
+    root.innerHTML = '<button id="inside-shadow">Inside shadow</button>';
+  </script>
+</body>
+</html>

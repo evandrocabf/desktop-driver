@@ -1109,6 +1109,7 @@ if [ "$ATSPI_MISSING" -eq 1 ]; then warn "install at-spi2-core before running de
 say ""
 info "Verify:   desktop doctor"
 info "Try it:   desktop apps && desktop snapshot --app <something you have open>"
+info "Browser:  desktop browser doctor && desktop browser open https://example.com --headless"
 if [ "$(uname -s)" != "Darwin" ]; then
   info "Session:  desktop session create NAME && desktop session start NAME --visible"
 fi

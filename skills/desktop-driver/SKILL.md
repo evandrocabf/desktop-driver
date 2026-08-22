@@ -18,6 +18,69 @@ The command is `desktop`. `desktop doctor` checks the environment and names anyt
 `desktop capabilities` says what this machine can and cannot do *before* you rely on it. Every
 command takes `--json`.
 
+## Route browser work first
+
+For content inside a Chromium page, use the browser-native namespace. It speaks CDP and has page
+semantics, durable profiles, navigation waits, tabs and compact `@eN` refs. Use the ordinary
+desktop commands for browser chrome (address bar, permission bubbles, downloads UI), Firefox, or
+any non-browser application.
+
+The agent loop is deliberately small:
+
+```bash
+desktop browser doctor
+desktop browser open https://example.com --headless
+desktop browser snapshot -i
+desktop browser fill @e2 "value"
+desktop browser click @e3
+desktop browser wait --load domcontentloaded
+desktop browser get text @e4
+desktop browser close
+```
+
+Snapshot before acting and snapshot again after navigation or a substantial DOM update. A fresh
+snapshot replaces the ref map. Use an `@eN` ref whenever possible; otherwise use exactly one of
+`css=...`, `xpath=...`, `text=...`, `--role ROLE [--name NAME]`, `--label`, or `--test-id`.
+Browser selectors must match exactly one element for actions.
+
+Useful browser commands:
+
+```bash
+desktop browser goto https://example.com/path
+desktop browser get title
+desktop browser get url
+desktop browser get value @e2
+desktop browser select @e5 option-value
+desktop browser check @e6
+desktop browser press Enter @e2
+desktop browser wait text=Finished --timeout 10000
+desktop browser wait --url /complete
+desktop browser screenshot --full-page --output /tmp/page.png
+desktop browser download @e8 --output /tmp/downloads
+desktop browser tab list
+desktop browser tab new https://example.com
+desktop browser dialog accept
+```
+
+Run `desktop browser install` if doctor finds no compatible Chrome/Chromium. `browser open` uses
+the active session name as its profile, or `default`; `--profile NAME` overrides it. Cookies and
+browser storage persist with that profile, while refs and live tab state do not.
+
+On Linux, visible browser work requires a matching visible agent session:
+
+```bash
+desktop session create example
+desktop session start example --visible
+desktop browser open https://example.com
+```
+
+Use `--headless` only when no user handoff is needed. For authentication, hand the visible browser
+to the user. Never request, observe, or type passwords, passkeys, or one-time codes. Browser
+snapshots and `get value` redact password fields, and `fill`/`type` refuse them. After the user says
+login is complete, continue with the same named profile. `--read-only` also applies to browser
+commands; `--no-steal-focus` is compatible with CDP because it never touches the host pointer or
+keyboard.
+
 ## Decide first: whose screen?
 
 This is the one decision that matters, and getting it wrong means typing into somebody's window.

@@ -1,0 +1,733 @@
+use std::{
+    io::{BufRead, BufReader, Write},
+    os::unix::net::{UnixListener, UnixStream},
+    path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde_json::{Value, json};
+
+use crate::{
+    BrowserError, BrowserResult, Command, GetKind, LoadState, Request, Response, Selector,
+    cdp::{Browser, js_string, snapshot_script},
+    paths::{browser_executable, profile_paths},
+};
+
+#[derive(Clone, Debug)]
+pub struct DaemonOptions {
+    pub profile: String,
+}
+
+pub struct Client {
+    profile: String,
+    socket: PathBuf,
+}
+
+impl Client {
+    pub fn new(profile: &str) -> BrowserResult<Self> {
+        Ok(Self {
+            profile: profile.into(),
+            socket: profile_paths(profile)?.socket,
+        })
+    }
+    pub fn is_running(&self) -> bool {
+        UnixStream::connect(&self.socket).is_ok()
+    }
+    pub fn request(&self, command: Command) -> BrowserResult<Response> {
+        let mut stream = UnixStream::connect(&self.socket).map_err(|_| {
+            BrowserError::new(
+                "browser_not_running",
+                format!("browser profile {:?} is not running", self.profile),
+            )
+            .remedy("Run `desktop browser open [URL]` first.")
+        })?;
+        stream.set_read_timeout(Some(Duration::from_secs(130))).ok();
+        serde_json::to_writer(&mut stream, &Request { command }).map_err(protocol)?;
+        stream.write_all(b"\n").map_err(io_error)?;
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .map_err(io_error)?;
+        let response: Response = serde_json::from_str(&line).map_err(protocol)?;
+        Ok(response)
+    }
+}
+
+pub fn spawn_daemon(program: &Path, profile: &str) -> BrowserResult<()> {
+    let paths = profile_paths(profile)?;
+    if UnixStream::connect(&paths.socket).is_ok() {
+        return Ok(());
+    }
+    ProcessCommand::new(program)
+        .args(["__browser-daemon", "--profile", profile])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| BrowserError::new("daemon_start_failed", e.to_string()))?;
+    wait_for_socket(&paths.socket)
+}
+
+pub fn wait_for_socket(socket: &Path) -> BrowserResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if UnixStream::connect(socket).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(BrowserError::new(
+        "daemon_start_failed",
+        "browser daemon did not become ready within 5 seconds",
+    )
+    .retryable())
+}
+
+pub fn run_daemon(options: DaemonOptions) -> BrowserResult<()> {
+    let paths = profile_paths(&options.profile)?;
+    if let Some(parent) = paths.socket.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error)?;
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(io_error)?;
+    }
+    if paths.socket.exists() {
+        if UnixStream::connect(&paths.socket).is_ok() {
+            return Err(BrowserError::new(
+                "browser_already_running",
+                "a daemon already owns this profile",
+            ));
+        }
+        std::fs::remove_file(&paths.socket).map_err(io_error)?;
+    }
+    let listener = UnixListener::bind(&paths.socket).map_err(io_error)?;
+    listener.set_nonblocking(true).map_err(io_error)?;
+    let terminated = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&terminated);
+    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst)).map_err(|error| {
+        BrowserError::new(
+            "daemon_signal_handler_failed",
+            format!("could not install daemon termination handler: {error}"),
+        )
+    })?;
+    let mut state = State {
+        profile: options.profile.clone(),
+        browser: None,
+        should_exit: false,
+        headless_owned: false,
+        last_activity: Instant::now(),
+    };
+    loop {
+        if terminated.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if state.headless_owned
+                    && state.last_activity.elapsed() >= Duration::from_secs(60 * 60)
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(error) => return Err(io_error(error)),
+        };
+        let mut line = String::new();
+        let Ok(cloned) = stream.try_clone() else {
+            continue;
+        };
+        let Ok(read) = BufReader::new(cloned).read_line(&mut line) else {
+            continue;
+        };
+        // Readiness probes connect and close without a request. They must not
+        // turn into a response write on a dead peer and kill the daemon.
+        if read == 0 || line.trim().is_empty() {
+            continue;
+        }
+        let request = serde_json::from_str::<Request>(&line).map_err(protocol);
+        let response = match request {
+            Ok(request) => state.handle(request.command),
+            Err(error) => Response::failure(&options.profile, error),
+        };
+        state.last_activity = Instant::now();
+        if serde_json::to_writer(&mut stream, &response).is_err() {
+            continue;
+        }
+        if stream.write_all(b"\n").is_err() {
+            continue;
+        }
+        if state.should_exit {
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(&paths.socket);
+    Ok(())
+}
+
+struct State {
+    profile: String,
+    browser: Option<Browser>,
+    should_exit: bool,
+    headless_owned: bool,
+    last_activity: Instant,
+}
+
+impl State {
+    fn handle(&mut self, command: Command) -> Response {
+        match self.execute(command) {
+            Ok(result) => self.response(result),
+            Err(error) => Response::failure(&self.profile, error),
+        }
+    }
+    fn response(&mut self, result: Value) -> Response {
+        let mut response = Response::success(&self.profile, result);
+        if let Some(browser) = self.browser.as_mut() {
+            response.tab_id = Some(browser.target_id.clone());
+            response.document_id = Some(browser.document_id);
+            // Runtime is suspended while alert/confirm/prompt is open. Asking
+            // for location here would block the response that tells the next
+            // CLI invocation it may handle the dialog.
+            if browser.suppress_url_once {
+                browser.suppress_url_once = false;
+            } else if !browser.dialog_open {
+                response.url = browser.url().ok();
+            }
+        }
+        response
+    }
+    fn browser(&mut self) -> BrowserResult<&mut Browser> {
+        self.browser.as_mut().ok_or_else(|| {
+            BrowserError::new("browser_not_running", "no browser is open")
+                .remedy("Run `desktop browser open [URL]` first.")
+        })
+    }
+    fn execute(&mut self, command: Command) -> BrowserResult<Value> {
+        match command {
+            Command::Open {
+                url,
+                executable,
+                headless,
+            } => {
+                if self.browser.is_none() {
+                    let paths = profile_paths(&self.profile)?;
+                    let executable = browser_executable(executable.as_deref())?;
+                    self.browser = Some(Browser::launch(&executable, &paths.user_data, headless)?);
+                    self.headless_owned = headless;
+                }
+                if let Some(url) = url {
+                    navigate(self.browser()?, &url, 30_000)?;
+                }
+                Ok(json!({"opened":true,"headless":headless}))
+            }
+            Command::Connect { endpoint } => {
+                if self.browser.is_some() {
+                    return Err(BrowserError::new(
+                        "browser_already_running",
+                        "close the current browser before connecting",
+                    ));
+                }
+                self.browser = Some(Browser::connect(&endpoint)?);
+                self.headless_owned = false;
+                Ok(json!({"connected":true,"owned":false}))
+            }
+            Command::Status => Ok(json!({"running":self.browser.is_some()})),
+            Command::Close => {
+                self.browser.take();
+                self.should_exit = true;
+                Ok(json!({"closed":true}))
+            }
+            Command::Goto { url, timeout_ms } => {
+                navigate(self.browser()?, &url, timeout_ms)?;
+                Ok(json!({"navigated":true}))
+            }
+            Command::Back { timeout_ms } => {
+                history(self.browser()?, -1, timeout_ms)?;
+                Ok(json!({"navigated":true}))
+            }
+            Command::Forward { timeout_ms } => {
+                history(self.browser()?, 1, timeout_ms)?;
+                Ok(json!({"navigated":true}))
+            }
+            Command::Reload { timeout_ms } => {
+                let b = self.browser()?;
+                b.call("Page.reload", json!({}))?;
+                b.document_id += 1;
+                b.wait_ready(timeout_ms)?;
+                Ok(json!({"reloaded":true}))
+            }
+            Command::Snapshot {
+                interactive,
+                max_nodes,
+            } => {
+                let b = self.browser()?;
+                let elements = b.evaluate(&snapshot_script(interactive, max_nodes))?;
+                Ok(json!({"elements":elements,"interactive_only":interactive}))
+            }
+            Command::Screenshot { output, full_page } => {
+                screenshot(self.browser()?, &output, full_page)
+            }
+            Command::Get {
+                kind,
+                selector,
+                attribute,
+            } => get(
+                self.browser()?,
+                kind,
+                selector.as_ref(),
+                attribute.as_deref(),
+            ),
+            Command::Click { selector } => action(self.browser()?, &selector, Action::Click),
+            Command::Fill { selector, value } => {
+                action(self.browser()?, &selector, Action::Fill(value))
+            }
+            Command::Type {
+                selector,
+                value,
+                delay_ms,
+            } => type_text(self.browser()?, &selector, &value, delay_ms),
+            Command::Press { selector, key } => press(self.browser()?, selector.as_ref(), &key),
+            Command::Select { selector, values } => {
+                action(self.browser()?, &selector, Action::Select(values))
+            }
+            Command::Check { selector, checked } => {
+                action(self.browser()?, &selector, Action::Check(checked))
+            }
+            Command::Hover { selector } => action(self.browser()?, &selector, Action::Hover),
+            Command::Scroll { selector, x, y } => scroll(self.browser()?, selector.as_ref(), x, y),
+            Command::Download { selector, output } => {
+                std::fs::create_dir_all(&output).map_err(io_error)?;
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700))
+                        .map_err(io_error)?;
+                }
+                let browser = self.browser()?;
+                browser.call_browser(
+                    "Browser.setDownloadBehavior",
+                    json!({"behavior":"allow","downloadPath":output,"eventsEnabled":true}),
+                )?;
+                let clicked = action(browser, &selector, Action::Click)?;
+                Ok(json!({"download_started":true,"directory":output,"action":clicked}))
+            }
+            Command::Wait {
+                selector,
+                text,
+                url,
+                load,
+                hidden,
+                timeout_ms,
+            } => wait(
+                self.browser()?,
+                selector.as_ref(),
+                text.as_deref(),
+                url.as_deref(),
+                load,
+                hidden,
+                timeout_ms,
+            ),
+            Command::TabList => Ok(json!({"tabs":self.browser()?.tabs()?})),
+            Command::TabNew { url } => {
+                let b = self.browser()?;
+                let result = b.call_browser(
+                    "Target.createTarget",
+                    json!({"url":url.unwrap_or_else(||"about:blank".into())}),
+                )?;
+                let id = result["targetId"].as_str().unwrap_or_default().to_owned();
+                b.attach(&id)?;
+                b.document_id += 1;
+                Ok(json!({"created":id}))
+            }
+            Command::TabUse { target } => {
+                let b = self.browser()?;
+                let tabs = b.tabs()?;
+                let id = resolve_tab(&tabs, &target)?;
+                b.call_browser("Target.activateTarget", json!({"targetId":id}))?;
+                b.attach(&id)?;
+                b.document_id += 1;
+                Ok(json!({"active":id}))
+            }
+            Command::TabClose { target } => {
+                let b = self.browser()?;
+                let id = if let Some(target) = target {
+                    resolve_tab(&b.tabs()?, &target)?
+                } else {
+                    b.target_id.clone()
+                };
+                b.call_browser("Target.closeTarget", json!({"targetId":id}))?;
+                if id == b.target_id {
+                    b.attach_first_available()?;
+                    b.document_id += 1;
+                }
+                Ok(json!({"closed":id}))
+            }
+            Command::Dialog {
+                accept,
+                prompt_text,
+            } => {
+                let b = self.browser()?;
+                let mut params = json!({"accept":accept});
+                if let Some(prompt_text) = prompt_text {
+                    params["promptText"] = json!(prompt_text);
+                }
+                b.call("Page.handleJavaScriptDialog", params)?;
+                b.dialog_open = false;
+                Ok(json!({"handled":true,"accepted":accept}))
+            }
+        }
+    }
+}
+
+impl Browser {
+    fn attach_first_available(&mut self) -> BrowserResult<()> {
+        let tabs = self.tabs()?;
+        let id = tabs
+            .first()
+            .and_then(|t| t["targetId"].as_str())
+            .ok_or_else(|| BrowserError::new("tab_gone", "no tabs remain"))?
+            .to_owned();
+        self.attach(&id)
+    }
+}
+
+fn navigate(browser: &mut Browser, url: &str, timeout: u64) -> BrowserResult<()> {
+    let url = normalize_url(url)?;
+    let result = browser.call("Page.navigate", json!({"url":url}))?;
+    if let Some(error) = result["errorText"].as_str() {
+        return Err(BrowserError::new("navigation_failed", error));
+    }
+    browser.document_id += 1;
+    browser.wait_ready(timeout)
+}
+fn normalize_url(url: &str) -> BrowserResult<String> {
+    let value = if url.contains("://") || url.starts_with("about:") || url.starts_with("data:") {
+        url.to_owned()
+    } else {
+        format!("https://{url}")
+    };
+    if value.chars().any(char::is_whitespace)
+        || !["http://", "https://", "file://", "about:", "data:"]
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
+    {
+        return Err(BrowserError::new(
+            "invalid_url",
+            format!("unsupported or malformed URL {value:?}"),
+        ));
+    }
+    Ok(value)
+}
+fn history(browser: &mut Browser, delta: i32, timeout: u64) -> BrowserResult<()> {
+    browser.evaluate(&format!("history.go({delta})"))?;
+    browser.document_id += 1;
+    browser.wait_ready(timeout)
+}
+
+enum Action {
+    Click,
+    Fill(String),
+    Select(Vec<String>),
+    Check(bool),
+    Hover,
+}
+fn action(browser: &mut Browser, selector: &Selector, action: Action) -> BrowserResult<Value> {
+    let is_click = matches!(action, Action::Click);
+    let body=match action {
+        Action::Click=>"if(e.disabled)throw new Error('element_disabled');e.scrollIntoView({block:'center'});return new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>{const r=e.getBoundingClientRect();let x=r.left+r.width/2,y=r.top+r.height/2,p=e.ownerDocument.elementFromPoint(x,y);if(!r.width||!r.height)throw new Error('element_not_visible');if(p!==e&&!e.contains(p))throw new Error('element_obscured');let w=e.ownerDocument.defaultView;while(w.frameElement){const f=w.frameElement.getBoundingClientRect();x+=f.left;y+=f.top;w=w.parent}resolve({x,y})})));".into(),
+        Action::Fill(v)=>format!("if(e.type==='password')throw new Error('password_field_denied');if(e.disabled)throw new Error('element_disabled');const r=e.getBoundingClientRect();if(!r.width||!r.height)throw new Error('element_not_visible');if(!('value'in e)&&!e.isContentEditable)throw new Error('element_not_editable');e.focus();if(e.isContentEditable)e.textContent={0};else{{const s=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value');if(s&&s.set)s.set.call(e,{0});else e.value={0}}}e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{0}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{filled:true}};",js_string(&v)),
+        Action::Select(values)=>format!("if(e.tagName!=='SELECT')throw new Error('element_not_select');const v=new Set({});for(const o of e.options)o.selected=v.has(o.value)||v.has(o.text);e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{selected:[...e.selectedOptions].map(o=>o.value)}};",serde_json::to_string(&values).unwrap()),
+        Action::Check(checked)=>format!("if(!['checkbox','radio'].includes(e.type))throw new Error('element_not_checkable');if(e.checked!=={checked})e.click();return {{checked:e.checked}};"),
+        Action::Hover=>"e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect();e.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,clientX:r.left+r.width/2,clientY:r.top+r.height/2}));return {hovered:true};".into(),
+    };
+    let result = browser
+        .element_eval(selector, &body)
+        .map_err(classify_page_error)?;
+    if is_click {
+        let x = result["x"].as_f64().ok_or_else(|| {
+            BrowserError::new("element_not_actionable", "element has no clickable center")
+        })?;
+        let y = result["y"].as_f64().ok_or_else(|| {
+            BrowserError::new("element_not_actionable", "element has no clickable center")
+        })?;
+        browser.call(
+            "Input.dispatchMouseEvent",
+            json!({"type":"mouseMoved","x":x,"y":y}),
+        )?;
+        browser.call(
+            "Input.dispatchMouseEvent",
+            json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1}),
+        )?;
+        browser.send_no_wait(
+            "Input.dispatchMouseEvent",
+            json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1}),
+        )?;
+        browser.suppress_url_once = true;
+        return Ok(json!({"clicked":true}));
+    }
+    Ok(result)
+}
+fn type_text(
+    browser: &mut Browser,
+    selector: &Selector,
+    value: &str,
+    delay: u64,
+) -> BrowserResult<Value> {
+    browser.element_eval(selector,"if(e.type==='password')throw new Error('password_field_denied');e.focus();return true;").map_err(classify_page_error)?;
+    for ch in value.chars() {
+        browser.call("Input.insertText", json!({"text":ch.to_string()}))?;
+        if delay > 0 {
+            thread::sleep(Duration::from_millis(delay));
+        }
+    }
+    Ok(json!({"typed":true,"characters":value.chars().count()}))
+}
+fn press(browser: &mut Browser, selector: Option<&Selector>, key: &str) -> BrowserResult<Value> {
+    if let Some(selector) = selector {
+        browser.element_eval(selector, "e.focus();return true;")?;
+    }
+    browser.call(
+        "Input.dispatchKeyEvent",
+        json!({"type":"keyDown","key":key}),
+    )?;
+    browser.call("Input.dispatchKeyEvent", json!({"type":"keyUp","key":key}))?;
+    Ok(json!({"pressed":key}))
+}
+fn scroll(
+    browser: &mut Browser,
+    selector: Option<&Selector>,
+    x: i64,
+    y: i64,
+) -> BrowserResult<Value> {
+    match selector {
+        Some(s) => {
+            browser.element_eval(s, &format!("e.scrollBy({x},{y});return {{scrolled:true}};"))
+        }
+        None => browser.evaluate(&format!("scrollBy({x},{y});({{scrolled:true}})")),
+    }
+}
+fn get(
+    browser: &mut Browser,
+    kind: GetKind,
+    selector: Option<&Selector>,
+    attribute: Option<&str>,
+) -> BrowserResult<Value> {
+    match kind {
+        GetKind::Title => Ok(json!({"title":browser.evaluate("document.title")?})),
+        GetKind::Url => Ok(json!({"url":browser.url()?})),
+        GetKind::Count => {
+            let s = selector.ok_or_else(|| {
+                BrowserError::new("selector_required", "count requires a selector")
+            })?;
+            let script = format!("({}).length", Browser::selector_candidates_script(s));
+            Ok(json!({"count":browser.evaluate(&script)?}))
+        }
+        _ => {
+            let s = selector.ok_or_else(|| {
+                BrowserError::new(
+                    "selector_required",
+                    "this get operation requires a selector",
+                )
+            })?;
+            let body=match kind{GetKind::Text=>"return {text:(e.innerText||e.textContent||'').trim()};".into(),GetKind::Html=>"return {html:e.outerHTML};".into(),GetKind::Value=>"if(e.type==='password')return {value:null,redacted:true};return {value:e.value};".into(),GetKind::Attr=>format!("return {{attribute:{0},value:e.getAttribute({0})}};",js_string(attribute.ok_or_else(||BrowserError::new("attribute_required","get attr requires --attribute"))?)),_=>unreachable!()};
+            browser.element_eval(s, &body)
+        }
+    }
+}
+fn wait(
+    browser: &mut Browser,
+    selector: Option<&Selector>,
+    text: Option<&str>,
+    url: Option<&str>,
+    load: Option<LoadState>,
+    hidden: bool,
+    timeout: u64,
+) -> BrowserResult<Value> {
+    let deadline = Instant::now() + Duration::from_millis(timeout);
+    let mut network_sample: Option<(u64, Instant)> = None;
+    loop {
+        let matched = if let Some(s) = selector {
+            browser
+                .evaluate(&format!("!!({})", Browser::selector_script(s)))?
+                .as_bool()
+                .unwrap_or(false)
+                != hidden
+        } else if let Some(t) = text {
+            browser
+                .evaluate(&format!(
+                    "document.body&&document.body.innerText.includes({})",
+                    js_string(t)
+                ))?
+                .as_bool()
+                .unwrap_or(false)
+        } else if let Some(u) = url {
+            browser.url()?.contains(u)
+        } else if let Some(load) = load {
+            let ready = browser
+                .evaluate("document.readyState")?
+                .as_str()
+                .unwrap_or("")
+                .to_owned();
+            match load {
+                LoadState::Load => ready == "complete",
+                LoadState::Domcontentloaded => matches!(ready.as_str(), "interactive" | "complete"),
+                LoadState::Networkidle => {
+                    let count = browser
+                        .evaluate("performance.getEntriesByType('resource').length")?
+                        .as_u64()
+                        .unwrap_or(0);
+                    match network_sample {
+                        Some((previous, since)) if previous == count => {
+                            ready == "complete" && since.elapsed() >= Duration::from_millis(500)
+                        }
+                        _ => {
+                            network_sample = Some((count, Instant::now()));
+                            false
+                        }
+                    }
+                }
+            }
+        } else {
+            return Err(BrowserError::new(
+                "condition_required",
+                "wait requires a selector, --text, --url, or --load",
+            ));
+        };
+        if matched {
+            return Ok(json!({"matched":true}));
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                BrowserError::new("timeout", format!("timed out after {timeout}ms")).retryable(),
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+fn screenshot(browser: &mut Browser, output: &str, full_page: bool) -> BrowserResult<Value> {
+    let params = if full_page {
+        let m = browser.call("Page.getLayoutMetrics", json!({}))?;
+        let c = &m["cssContentSize"];
+        json!({"format":"png","captureBeyondViewport":true,"clip":{"x":0,"y":0,"width":c["width"],"height":c["height"],"scale":1}})
+    } else {
+        json!({"format":"png"})
+    };
+    let data = browser.call("Page.captureScreenshot", params)?["data"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = STANDARD
+        .decode(data)
+        .map_err(|e| BrowserError::new("screenshot_failed", e.to_string()))?;
+    if let Some(parent) = std::path::Path::new(output)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(output)
+            .map_err(io_error)?;
+        file.write_all(&bytes).map_err(io_error)?;
+    }
+    Ok(json!({"path":output,"bytes":bytes.len()}))
+}
+fn resolve_tab(tabs: &[Value], target: &str) -> BrowserResult<String> {
+    if let Ok(index) = target.parse::<usize>() {
+        return tabs
+            .get(index.saturating_sub(1))
+            .and_then(|t| t["targetId"].as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| BrowserError::new("tab_gone", format!("tab {target} does not exist")));
+    }
+    tabs.iter()
+        .find(|t| {
+            t["targetId"] == target || t["title"].as_str().is_some_and(|v| v.contains(target))
+        })
+        .and_then(|t| t["targetId"].as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| BrowserError::new("tab_gone", format!("no tab matched {target:?}")))
+}
+fn classify_page_error(mut error: BrowserError) -> BrowserError {
+    for (needle, code, message) in [
+        (
+            "password_field_denied",
+            "password_field_denied",
+            "agents cannot write passwords, passkeys, or one-time codes; hand the visible browser to the user",
+        ),
+        (
+            "element_disabled",
+            "element_not_actionable",
+            "element is disabled",
+        ),
+        (
+            "element_obscured",
+            "element_not_actionable",
+            "element is obscured",
+        ),
+        (
+            "element_not_visible",
+            "element_not_actionable",
+            "element is not visible",
+        ),
+        (
+            "element_not_editable",
+            "element_not_actionable",
+            "element is not editable",
+        ),
+        (
+            "element_detached",
+            "element_stale",
+            "element is detached; take a fresh snapshot",
+        ),
+    ] {
+        if error.message.contains(needle) {
+            error.code = code.into();
+            error.message = message.into();
+        }
+    }
+    error
+}
+fn io_error(e: std::io::Error) -> BrowserError {
+    BrowserError::new("browser_io_error", e.to_string())
+}
+fn protocol(e: impl std::fmt::Display) -> BrowserError {
+    BrowserError::new("protocol_error", e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires local Unix socket capability"]
+    fn daemon_protocol_survives_separate_status_and_close_requests() {
+        let profile = format!("test_{}", std::process::id());
+        let options = DaemonOptions {
+            profile: profile.clone(),
+        };
+        let handle = std::thread::spawn(move || run_daemon(options));
+        wait_for_socket(&profile_paths(&profile).unwrap().socket).unwrap();
+        let client = Client::new(&profile).unwrap();
+        let status = client.request(Command::Status).unwrap();
+        assert!(status.ok);
+        assert_eq!(status.result.unwrap()["running"], false);
+        let closed = client.request(Command::Close).unwrap();
+        assert!(closed.ok);
+        handle.join().unwrap().unwrap();
+    }
+}

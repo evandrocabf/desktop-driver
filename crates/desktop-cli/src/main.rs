@@ -56,7 +56,12 @@ fn build_driver(cli: &Cli) -> Result<Driver, DesktopError> {
 fn describes_only(command: &Command) -> bool {
     matches!(
         command,
-        Command::Info | Command::Capabilities | Command::Doctor | Command::Session(_)
+        Command::Info
+            | Command::Capabilities
+            | Command::Doctor
+            | Command::Session(_)
+            | Command::Browser(_)
+            | Command::BrowserDaemon(_)
     )
 }
 
