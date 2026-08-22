@@ -311,9 +311,9 @@ pub struct BrowserSelectArgs {
 pub struct BrowserScrollArgs {
     #[command(flatten)]
     pub selector: BrowserTargetArgs,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0)]
     pub x: i64,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, allow_negative_numbers = true, default_value_t = 0)]
     pub y: i64,
 }
 
@@ -717,7 +717,7 @@ mod tests {
 
     #[test]
     fn the_documented_example_invocations_all_parse() {
-        // These are the exact forms promised in the README and --help.
+        // These are exact forms promised in the README, installed skill and --help.
         let examples: &[&[&str]] = &[
             &["desktop", "apps"],
             &["desktop", "windows"],
@@ -786,6 +786,101 @@ mod tests {
             &["desktop", "browser", "download", "@e8", "--output", "/tmp"],
             &["desktop", "browser", "tab", "new", "https://example.com"],
             &["desktop", "browser", "dialog", "dismiss"],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "status",
+                "--profile",
+                "research",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "goto",
+                "https://example.com/form",
+                "--timeout",
+                "30000",
+            ],
+            &["desktop", "--json", "browser", "snapshot", "--interactive"],
+            &["desktop", "--json", "browser", "press", "Enter", "@e2"],
+            &[
+                "desktop", "--json", "browser", "type", "@e2", "value", "--delay", "25",
+            ],
+            &[
+                "desktop", "--json", "browser", "select", "@e5", "one", "two",
+            ],
+            &["desktop", "--json", "browser", "scroll", "--y", "-500"],
+            &[
+                "desktop", "--json", "browser", "get", "attr", "css=a", "href",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "get",
+                "text",
+                "--label",
+                "Email address",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "wait",
+                "css=.spinner",
+                "--hidden",
+                "--timeout",
+                "10000",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "wait",
+                "--url",
+                "/complete",
+                "--timeout",
+                "10000",
+            ],
+            &["desktop", "--json", "browser", "tab", "use", "2"],
+            &["desktop", "--json", "browser", "tab", "close"],
+            &[
+                "desktop",
+                "--json",
+                "browser",
+                "dialog",
+                "accept",
+                "--prompt-text",
+                "value",
+            ],
+            &["desktop", "--json", "session", "list"],
+            &["desktop", "--json", "session", "create", "task-name"],
+            &[
+                "desktop",
+                "--json",
+                "session",
+                "start",
+                "task-name",
+                "--visible",
+            ],
+            &[
+                "desktop",
+                "--json",
+                "session",
+                "run",
+                "firefox",
+                "https://example.com",
+            ],
+            &[
+                "desktop",
+                "--no-steal-focus",
+                "--json",
+                "snapshot",
+                "--app",
+                "Calculator",
+            ],
         ];
         for argv in examples {
             Cli::try_parse_from(*argv)

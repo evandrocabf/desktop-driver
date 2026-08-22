@@ -39,7 +39,7 @@ printf '%s\n' 'removed source file' >"$OLD/obsolete-source.txt"
 
 cp "$ROOT/install.sh" "$ARCHIVE_ROOT/install.sh"
 cp "$ROOT/Cargo.toml" "$ARCHIVE_ROOT/Cargo.toml"
-cp "$ROOT/skills/desktop-driver/SKILL.md" "$ARCHIVE_ROOT/skills/desktop-driver/SKILL.md"
+cp -R "$ROOT/skills/desktop-driver/." "$ARCHIVE_ROOT/skills/desktop-driver/"
 tar -czf "$SCRATCH/source.tar.gz" -C "$SCRATCH/archive" "desktop-driver-$EXPECTED_VERSION"
 
 printf '%s\n' '#!/usr/bin/env bash' 'echo "desktop 0.0.0"' >"$PREFIX/desktop"
@@ -65,13 +65,17 @@ env \
   XDG_STATE_HOME="$STATE" \
   XDG_DATA_HOME="$DATA" \
   DESKTOP_DRIVER_TEST_ARCHIVE="$SCRATCH/source.tar.gz" \
-  "$OLD/install.sh" --update --src "$OLD" --no-build --agents agents --copy --prefix "$PREFIX"
+  "$OLD/install.sh" --update --src "$OLD" --no-build --agents agents,cline --copy --prefix "$PREFIX"
 
 [ "$("$PREFIX/desktop" --version)" = "desktop $EXPECTED_VERSION" ]
 cmp "$OLD/skills/desktop-driver/SKILL.md" "$ROOT/skills/desktop-driver/SKILL.md"
+cmp "$OLD/skills/desktop-driver/references/browser.md" "$ROOT/skills/desktop-driver/references/browser.md"
 [ ! -e "$OLD/skills/desktop-driver/obsolete.md" ]
 [ ! -e "$OLD/obsolete-source.txt" ]
 [ ! -e "$TEST_HOME/.agents/skills/desktop-driver/obsolete.md" ]
+cmp "$TEST_HOME/.agents/skills/desktop-driver/references/sessions.md" "$ROOT/skills/desktop-driver/references/sessions.md"
+grep -q '^# Bundled reference: browser.md$' "$TEST_HOME/Documents/Cline/Rules/desktop-driver.md"
+grep -q '^# Browser-native page automation$' "$TEST_HOME/Documents/Cline/Rules/desktop-driver.md"
 [ "$(cat "$DATA/desktop-driver/sessions/github/home/cookie")" = "login-cookie" ]
 
 # A Git checkout remains a local-source installation after the updater moves
