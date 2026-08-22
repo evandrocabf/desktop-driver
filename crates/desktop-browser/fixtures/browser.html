@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>desktop browser fixture</title>
+  <style>
+    #css-hidden { display: none; }
+    #hover-target:hover + #hover-result { visibility: visible; }
+    #hover-result { visibility: hidden; }
+  </style>
+</head>
+<body>
+  <h1>Browser fixture</h1>
+  <form id="profile">
+    <label>Name <input id="name" data-testid="name" autocomplete="off"></label>
+    <label>Disabled <input id="disabled" disabled></label>
+    <label>Password <input id="password" type="password"></label>
+    <label>Plan
+      <select id="plan"><option value="free">Free</option><option value="pro">Pro</option></select>
+    </label>
+    <label><input id="terms" type="checkbox"> Accept terms</label>
+    <button id="save" type="submit">Save</button>
+  </form>
+  <p id="result">Idle</p>
+  <p id="css-hidden">Hidden but still in the DOM</p>
+  <button id="hover-target" type="button">Hover target</button>
+  <span id="hover-result">Hover revealed</span>
+  <button id="dialog" type="button">Open dialog</button>
+  <a id="download" href="data:text/plain,desktop-driver" download="fixture.txt">Download file</a>
+  <div id="shadow-host"></div>
+  <iframe id="child" title="Child frame" srcdoc="<button id='inside-frame'>Inside frame</button>"></iframe>
+  <script>
+    const savedName = localStorage.getItem('savedName');
+    if (savedName) document.querySelector('#name').value = savedName;
+    document.querySelector('#profile').addEventListener('submit', event => {
+      event.preventDefault();
+      const name = document.querySelector('#name').value;
+      localStorage.setItem('savedName', name);
+      document.querySelector('#result').textContent = `Saved ${name}`;
+      history.pushState({}, '', '#saved');
+    });
+    document.querySelector('#dialog').addEventListener('click', () => alert('Fixture dialog'));
+    const root = document.querySelector('#shadow-host').attachShadow({mode: 'open'});
+    root.innerHTML = '<button id="inside-shadow">Inside shadow</button>';
+  </script>
+</body>
+</html>

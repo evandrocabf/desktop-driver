@@ -58,6 +58,7 @@ wrong fallback.
 ```
 crates/desktop-core     models, snapshot normalizer, selectors, policy, errors, the Driver,
                         and the four ports. forbid(unsafe_code); builds on any platform.
+crates/desktop-browser  direct CDP transport, per-profile daemon and page automation.
 crates/desktop-linux    AT-SPI, X11/XTEST/EWMH, xdg-desktop-portal, agent sessions.
 crates/desktop-macos    AXUIElement, CGWindowList, ScreenCaptureKit, CGEvent.
 crates/desktop-cli      the `desktop` binary.

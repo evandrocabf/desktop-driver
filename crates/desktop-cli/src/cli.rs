@@ -110,6 +110,286 @@ pub enum Command {
     /// Give the agent a display of its own, so it stops sharing yours.
     #[command(subcommand)]
     Session(SessionCommand),
+
+    /// Navigate and automate Chromium with browser-native semantics.
+    #[command(subcommand)]
+    Browser(BrowserCommand),
+
+    /// Internal browser daemon entrypoint.
+    #[command(name = "__browser-daemon", hide = true)]
+    BrowserDaemon(BrowserDaemonArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserDaemonArgs {
+    #[arg(long)]
+    pub profile: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BrowserCommand {
+    /// Install the pinned Chrome for Testing build.
+    Install,
+    /// Show browser detection, profile and daemon diagnostics.
+    Doctor(BrowserProfileArgs),
+    /// Start a managed browser and optionally navigate.
+    Open(BrowserOpenArgs),
+    /// Attach to an existing loopback CDP HTTP or WebSocket endpoint.
+    Connect(BrowserConnectArgs),
+    /// Show managed browser state.
+    Status(BrowserProfileArgs),
+    /// Close the managed browser, or disconnect an attached one.
+    Close(BrowserProfileArgs),
+    /// Navigate the active tab.
+    Goto(BrowserGotoArgs),
+    /// Go back one history entry.
+    Back(BrowserTimeoutArgs),
+    /// Go forward one history entry.
+    Forward(BrowserTimeoutArgs),
+    /// Reload the active tab.
+    Reload(BrowserTimeoutArgs),
+    /// Print a compact page snapshot and assign @eN refs.
+    Snapshot(BrowserSnapshotArgs),
+    /// Capture the active page as PNG.
+    Screenshot(BrowserScreenshotArgs),
+    /// Read page or element data.
+    #[command(subcommand)]
+    Get(BrowserGetCommand),
+    /// Click one uniquely matched element.
+    Click(BrowserTargetArgs),
+    /// Replace a field's value. Password fields are always refused.
+    Fill(BrowserValueArgs),
+    /// Type incrementally into a field. Password fields are always refused.
+    Type(BrowserTypeArgs),
+    /// Send a key to the page or an element.
+    Press(BrowserPressArgs),
+    /// Select one or more option values.
+    Select(BrowserSelectArgs),
+    /// Check a checkbox or radio.
+    Check(BrowserTargetArgs),
+    /// Uncheck a checkbox.
+    Uncheck(BrowserTargetArgs),
+    /// Hover an element.
+    Hover(BrowserTargetArgs),
+    /// Scroll the page or an element.
+    Scroll(BrowserScrollArgs),
+    /// Click an element with downloads enabled in the given directory.
+    Download(BrowserDownloadArgs),
+    /// Wait for a selector, text, URL or load state.
+    Wait(BrowserWaitArgs),
+    /// List, create, switch and close tabs.
+    #[command(subcommand)]
+    Tab(BrowserTabCommand),
+    /// Accept or dismiss the current JavaScript dialog.
+    #[command(subcommand)]
+    Dialog(BrowserDialogCommand),
+}
+
+#[derive(Debug, Args, Default)]
+pub struct BrowserProfileArgs {
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserOpenArgs {
+    pub url: Option<String>,
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub executable: Option<String>,
+    /// Run without a watchable browser window.
+    #[arg(long)]
+    pub headless: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserConnectArgs {
+    pub endpoint: String,
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserGotoArgs {
+    pub url: String,
+    #[command(flatten)]
+    pub common: BrowserTimeoutArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserTimeoutArgs {
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+    #[arg(long, default_value_t = 30_000)]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserSnapshotArgs {
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
+    pub max_nodes: Option<usize>,
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserScreenshotArgs {
+    #[arg(long, short = 'o', default_value = "browser.png")]
+    pub output: String,
+    #[arg(long)]
+    pub full_page: bool,
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Args, Clone, Default)]
+pub struct BrowserTargetArgs {
+    /// @eN, css=..., xpath=..., or text=...
+    pub target: Option<String>,
+    #[arg(long)]
+    pub role: Option<String>,
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub label: Option<String>,
+    #[arg(long = "test-id")]
+    pub test_id: Option<String>,
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserValueArgs {
+    #[command(flatten)]
+    pub selector: BrowserTargetArgs,
+    /// Literal value to enter.
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserTypeArgs {
+    #[command(flatten)]
+    pub selector: BrowserTargetArgs,
+    pub value: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    pub delay: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserPressArgs {
+    pub key: String,
+    #[command(flatten)]
+    pub selector: BrowserTargetArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserSelectArgs {
+    #[command(flatten)]
+    pub selector: BrowserTargetArgs,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserScrollArgs {
+    #[command(flatten)]
+    pub selector: BrowserTargetArgs,
+    #[arg(long, default_value_t = 0)]
+    pub x: i64,
+    #[arg(long, default_value_t = 0)]
+    pub y: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserDownloadArgs {
+    #[command(flatten)]
+    pub selector: BrowserTargetArgs,
+    #[arg(long, short = 'o', default_value = ".")]
+    pub output: String,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserWaitArgs {
+    #[command(flatten)]
+    pub selector: BrowserTargetArgs,
+    #[arg(long)]
+    pub text: Option<String>,
+    #[arg(long)]
+    pub url: Option<String>,
+    #[arg(long, value_enum)]
+    pub load: Option<BrowserLoadArg>,
+    #[arg(long)]
+    pub hidden: bool,
+    #[arg(long, default_value_t = 30_000)]
+    pub timeout: u64,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum BrowserLoadArg {
+    Load,
+    Domcontentloaded,
+    Networkidle,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BrowserGetCommand {
+    Text(BrowserTargetArgs),
+    Html(BrowserTargetArgs),
+    Value(BrowserTargetArgs),
+    Attr(BrowserAttrArgs),
+    Title(BrowserProfileArgs),
+    Url(BrowserProfileArgs),
+    Count(BrowserTargetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserAttrArgs {
+    #[command(flatten)]
+    pub selector: BrowserTargetArgs,
+    pub attribute: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BrowserTabCommand {
+    List(BrowserProfileArgs),
+    New(BrowserTabNewArgs),
+    Use(BrowserTabUseArgs),
+    Close(BrowserTabCloseArgs),
+}
+#[derive(Debug, Args)]
+pub struct BrowserTabNewArgs {
+    pub url: Option<String>,
+    #[arg(long)]
+    pub profile: Option<String>,
+}
+#[derive(Debug, Args)]
+pub struct BrowserTabUseArgs {
+    pub target: String,
+    #[arg(long)]
+    pub profile: Option<String>,
+}
+#[derive(Debug, Args)]
+pub struct BrowserTabCloseArgs {
+    pub target: Option<String>,
+    #[arg(long)]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BrowserDialogCommand {
+    Accept(BrowserDialogArgs),
+    Dismiss(BrowserProfileArgs),
+}
+#[derive(Debug, Args)]
+pub struct BrowserDialogArgs {
+    #[arg(long)]
+    pub prompt_text: Option<String>,
+    #[arg(long)]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -442,6 +722,25 @@ mod tests {
             &["desktop", "session", "run", "firefox"],
             &["desktop", "session", "run", "firefox", "https://x.com"],
             &["desktop", "snapshot", "--host"],
+            &["desktop", "browser", "doctor"],
+            &[
+                "desktop",
+                "browser",
+                "open",
+                "https://example.com",
+                "--headless",
+            ],
+            &["desktop", "browser", "snapshot", "-i"],
+            &["desktop", "browser", "fill", "@e2", "value"],
+            &["desktop", "browser", "click", "@e3"],
+            &[
+                "desktop", "browser", "click", "--role", "button", "--name", "Save",
+            ],
+            &["desktop", "browser", "wait", "--load", "domcontentloaded"],
+            &["desktop", "browser", "get", "text", "@e4"],
+            &["desktop", "browser", "download", "@e8", "--output", "/tmp"],
+            &["desktop", "browser", "tab", "new", "https://example.com"],
+            &["desktop", "browser", "dialog", "dismiss"],
         ];
         for argv in examples {
             Cli::try_parse_from(*argv)

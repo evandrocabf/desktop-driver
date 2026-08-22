@@ -52,6 +52,7 @@ can no longer find at least two such paths, so the gate cannot quietly stop chec
 | the agent display's `Xauthority` | `$XDG_RUNTIME_DIR/desktop-driver/sessions/<name>/` | `0600` |
 | portal restore token | `$XDG_STATE_HOME/desktop-driver/` | `0600` |
 | named browser homes | `$XDG_DATA_HOME/desktop-driver/sessions/<name>/home` | `0700` |
+| browser CDP socket directory | `$XDG_RUNTIME_DIR/desktop-driver/browser/` | `0700` |
 
 Where there is no runtime directory — a container, a cron job, a login without systemd — the first
 four fall back to the shared temporary directory, which is world-writable. The files are owner-only
@@ -72,6 +73,12 @@ generated per session from `/dev/urandom` and stored `0600`, and the X server is
 It is **not** a security boundary against the applications inside it. It separates two users of one
 machine from each other's *screens*; it does not confine what those applications may do. For that,
 use a container or a VM.
+
+The browser-native daemon listens only on a local Unix socket. Managed Chromium exposes CDP on
+`127.0.0.1` with an ephemeral port and a dedicated user-data directory; explicit attachment
+refuses non-loopback WebSocket endpoints. `browser close` terminates only a managed Chromium child
+and merely disconnects from an attached browser. Browser password inputs are returned as
+`value: null, redacted: true`, and `fill`/`type` refuse them independently of caller policy.
 
 ## What we do treat as a vulnerability
 

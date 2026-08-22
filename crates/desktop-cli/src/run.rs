@@ -45,7 +45,7 @@ pub fn run(
     out: &mut dyn Write,
 ) -> ExitCategory {
     let display = match &cli.command {
-        Command::Session(_) => None,
+        Command::Session(_) | Command::BrowserDaemon(_) => None,
         _ if cli.host => None,
         _ => sessions.status().map(|session| session.display),
     };
@@ -56,6 +56,21 @@ pub fn run(
     {
         sink.line(&format!("[agent display {display}]"));
         sink.blank();
+    }
+
+    if let Command::Browser(command) = &cli.command {
+        return crate::browser::run(command, cli, sessions, &mut sink);
+    }
+    if let Command::BrowserDaemon(args) = &cli.command {
+        return match desktop_browser::run_daemon(desktop_browser::DaemonOptions {
+            profile: args.profile.clone(),
+        }) {
+            Ok(()) => ExitCategory::Success,
+            Err(error) => {
+                crate::browser::render_browser_error(&mut sink, &error);
+                ExitCategory::BackendFailure
+            }
+        };
     }
 
     match dispatch(cli, driver, sessions, &mut sink) {
@@ -181,6 +196,9 @@ fn dispatch(
                 args.interval,
             )?;
             output::render_elements(sink, &[found])
+        }
+        Command::Browser(_) | Command::BrowserDaemon(_) => {
+            unreachable!("browser commands are handled before desktop dispatch")
         }
     }
 }

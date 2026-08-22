@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod browser;
 pub mod cli;
 mod live;
 pub mod output;

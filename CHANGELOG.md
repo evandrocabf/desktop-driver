@@ -4,9 +4,38 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-08-22
 
-Nothing yet.
+### Added
+
+- **Browser-native Chromium automation.** `desktop browser` now provides managed persistent
+  profiles, direct loopback CDP attachment, navigation, compact interactive snapshots with `@eN`
+  refs, semantic/CSS/XPath/text locators, actionability-checked pointer actions, form controls,
+  reads, waits, screenshots, tabs, downloads and JavaScript dialog handling. A per-profile local daemon keeps
+  CDP state alive between CLI invocations without Node, Playwright, MCP, or an embedded model.
+- **Pinned browser provisioning.** `desktop browser install` downloads Chrome for Testing
+  151.0.7922.174 from Google's official storage and verifies a platform-specific SHA-256 before
+  installing the complete browser tree.
+- **Agent-oriented browser guidance.** The installed skill routes page content through the browser
+  namespace, keeps browser chrome and non-Chromium applications on desktop accessibility, and
+  teaches the complete snapshot/action/wait/read loop.
+
+### Security
+
+- Visible Linux browsers require a matching visible agent session. CDP attachment is loopback-only,
+  password values are redacted, and browser fill/type unconditionally refuses password fields.
+  Existing `--read-only` and `--deny-role` policy flags apply to browser actions.
+  SIGINT/SIGTERM is handled so stopping a session also cleans up the managed Chromium child.
+
+### Fixed
+
+- Browser navigation now waits for the new document loader, `networkidle` tracks CDP requests in
+  flight, hover uses real pointer movement, and targeted typing verifies visibility, editability
+  and focus before inserting text.
+- Managed Chromium closes gracefully so persistent profile data is flushed, failed launches clean
+  up their child process, and reopening a profile cannot silently change its visible/headless mode.
+- Browser output paths resolve in the invoking CLI process. Screenshots are owner-only even when
+  overwritten, while pre-existing download directories retain their caller-owned permissions.
 
 ## [0.1.0] - 2026-08-21
 
