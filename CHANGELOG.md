@@ -27,6 +27,16 @@ All notable changes to this project are documented here. The format follows
   Existing `--read-only` and `--deny-role` policy flags apply to browser actions.
   SIGINT/SIGTERM is handled so stopping a session also cleans up the managed Chromium child.
 
+### Fixed
+
+- Browser navigation now waits for the new document loader, `networkidle` tracks CDP requests in
+  flight, hover uses real pointer movement, and targeted typing verifies visibility, editability
+  and focus before inserting text.
+- Managed Chromium closes gracefully so persistent profile data is flushed, failed launches clean
+  up their child process, and reopening a profile cannot silently change its visible/headless mode.
+- Browser output paths resolve in the invoking CLI process. Screenshots are owner-only even when
+  overwritten, while pre-existing download directories retain their caller-owned permissions.
+
 ## [0.1.0] - 2026-08-21
 
 The first release. Install from the repository with `install.sh`, which downloads or builds the

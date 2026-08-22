@@ -33,6 +33,8 @@ pub fn run(
                 }
                 "element_not_found"
                 | "element_not_actionable"
+                | "browser_mode_mismatch"
+                | "invalid_output_path"
                 | "tab_gone"
                 | "invalid_url"
                 | "invalid_profile" => ExitCategory::TargetFailure,
@@ -205,7 +207,7 @@ fn command_to_wire(command: &BrowserCommand) -> Result<Command, BrowserError> {
                 .unwrap_or(if a.interactive || !a.all { 200 } else { 500 }),
         },
         BrowserCommand::Screenshot(a) => Command::Screenshot {
-            output: a.output.clone(),
+            output: absolute_output_path(&a.output)?,
             full_page: a.full_page,
         },
         BrowserCommand::Get(get) => match get {
@@ -298,7 +300,7 @@ fn command_to_wire(command: &BrowserCommand) -> Result<Command, BrowserError> {
         },
         BrowserCommand::Download(a) => Command::Download {
             selector: selector(&a.selector)?,
-            output: a.output.clone(),
+            output: absolute_output_path(&a.output)?,
         },
         BrowserCommand::Wait(a) => Command::Wait {
             selector: optional_selector(&a.selector)?,
@@ -658,6 +660,26 @@ fn sha256_file(path: &std::path::Path) -> Result<String, BrowserError> {
     }
     Ok(format!("{:x}", digest.finalize()))
 }
+fn absolute_output_path(path: &str) -> Result<String, BrowserError> {
+    absolute_output_path_from(path, &std::env::current_dir().map_err(io_error)?)
+}
+fn absolute_output_path_from(
+    path: &str,
+    current_dir: &std::path::Path,
+) -> Result<String, BrowserError> {
+    let path = std::path::PathBuf::from(path);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        current_dir.join(path)
+    };
+    absolute.into_os_string().into_string().map_err(|_| {
+        BrowserError::new(
+            "invalid_output_path",
+            "browser output paths must contain valid UTF-8",
+        )
+    })
+}
 fn io_error(e: std::io::Error) -> BrowserError {
     BrowserError::new("browser_io_error", e.to_string())
 }
@@ -675,5 +697,18 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn relative_browser_outputs_are_resolved_against_the_invoking_process() {
+        let cwd = std::path::Path::new("/tmp/caller");
+        assert_eq!(
+            absolute_output_path_from("captures/browser.png", cwd).unwrap(),
+            "/tmp/caller/captures/browser.png"
+        );
+        assert_eq!(
+            absolute_output_path_from("/tmp/downloads", cwd).unwrap(),
+            "/tmp/downloads"
+        );
     }
 }

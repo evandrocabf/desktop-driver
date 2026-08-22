@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::{Read as _, Write as _},
     net::TcpStream,
     process::{Child, Command, Stdio},
@@ -20,6 +21,8 @@ pub struct Browser {
     pub document_id: u64,
     pub dialog_open: bool,
     pub suppress_url_once: bool,
+    inflight_requests: HashSet<String>,
+    network_idle_since: Option<Instant>,
 }
 
 impl Browser {
@@ -57,38 +60,57 @@ impl Browser {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = command.spawn().map_err(|error| {
+        let active = user_data.join("DevToolsActivePort");
+        if active.exists() {
+            std::fs::remove_file(&active).map_err(io_error)?;
+        }
+        let mut child = command.spawn().map_err(|error| {
             BrowserError::new(
                 "browser_launch_failed",
                 format!("could not launch {}: {error}", executable.display()),
             )
         })?;
-        let active = user_data.join("DevToolsActivePort");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let contents = loop {
-            if let Ok(contents) = std::fs::read_to_string(&active) {
-                break contents;
+        let setup = (|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let contents = loop {
+                if let Ok(contents) = std::fs::read_to_string(&active) {
+                    break contents;
+                }
+                if Instant::now() >= deadline {
+                    return Err(BrowserError::new(
+                        "browser_launch_failed",
+                        "Chromium did not publish its DevTools endpoint within 10 seconds",
+                    )
+                    .retryable());
+                }
+                if child.try_wait().map_err(io_error)?.is_some() {
+                    return Err(BrowserError::new(
+                        "browser_launch_failed",
+                        "Chromium exited before publishing its DevTools endpoint",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
+            let mut lines = contents.lines();
+            let port = lines.next().ok_or_else(|| {
+                BrowserError::new("browser_disconnected", "invalid DevToolsActivePort")
+            })?;
+            let path = lines.next().ok_or_else(|| {
+                BrowserError::new("browser_disconnected", "invalid DevToolsActivePort")
+            })?;
+            let endpoint = format!("ws://127.0.0.1:{port}{path}");
+            Self::connect(&endpoint)
+        })();
+        match setup {
+            Ok(mut browser) => {
+                browser.child = Some(child);
+                Ok(browser)
             }
-            if Instant::now() >= deadline {
-                return Err(BrowserError::new(
-                    "browser_launch_failed",
-                    "Chromium did not publish its DevTools endpoint within 10 seconds",
-                )
-                .retryable());
+            Err(error) => {
+                terminate_failed_launch(&mut child);
+                Err(error)
             }
-            thread::sleep(Duration::from_millis(50));
-        };
-        let mut lines = contents.lines();
-        let port = lines.next().ok_or_else(|| {
-            BrowserError::new("browser_disconnected", "invalid DevToolsActivePort")
-        })?;
-        let path = lines.next().ok_or_else(|| {
-            BrowserError::new("browser_disconnected", "invalid DevToolsActivePort")
-        })?;
-        let endpoint = format!("ws://127.0.0.1:{port}{path}");
-        let mut browser = Self::connect(&endpoint)?;
-        browser.child = Some(child);
-        Ok(browser)
+        }
     }
 
     pub fn connect(endpoint: &str) -> BrowserResult<Self> {
@@ -118,6 +140,8 @@ impl Browser {
             document_id: 1,
             dialog_open: false,
             suppress_url_once: false,
+            inflight_requests: HashSet::new(),
+            network_idle_since: Some(Instant::now()),
         };
         this.attach_first_page()?;
         Ok(this)
@@ -157,9 +181,12 @@ impl Browser {
             "Runtime.enable",
             "DOM.enable",
             "Accessibility.enable",
+            "Network.enable",
         ] {
             self.call(method, json!({}))?;
         }
+        self.inflight_requests.clear();
+        self.network_idle_since = Some(Instant::now());
         Ok(())
     }
 
@@ -178,6 +205,15 @@ impl Browser {
         }
         self.socket
             .send(Message::Text(request.to_string()))
+            .map_err(cdp_io)
+    }
+    fn request_browser_close(&mut self) -> BrowserResult<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.socket
+            .send(Message::Text(
+                json!({"id":id,"method":"Browser.close","params":{}}).to_string(),
+            ))
             .map_err(cdp_io)
     }
     fn call_inner(&mut self, method: &str, params: Value, session: bool) -> BrowserResult<Value> {
@@ -199,6 +235,7 @@ impl Browser {
             };
             let value: Value = serde_json::from_str(&text)
                 .map_err(|e| BrowserError::new("cdp_protocol_error", e.to_string()))?;
+            self.process_event(&value);
             if value["method"] == "Page.javascriptDialogOpening" {
                 self.dialog_open = true;
                 // Chromium pauses the mouseReleased response while JavaScript
@@ -222,6 +259,18 @@ impl Browser {
             }
             return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
         }
+    }
+
+    fn process_event(&mut self, value: &Value) {
+        let Some(method) = value["method"].as_str() else {
+            return;
+        };
+        update_network_activity(
+            &mut self.inflight_requests,
+            &mut self.network_idle_since,
+            method,
+            &value["params"],
+        );
     }
 
     pub fn evaluate(&mut self, expression: &str) -> BrowserResult<Value> {
@@ -266,6 +315,48 @@ impl Browser {
         }
     }
 
+    pub fn current_loader_id(&mut self) -> BrowserResult<String> {
+        Ok(
+            self.call("Page.getFrameTree", json!({}))?["frameTree"]["frame"]["loaderId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    }
+
+    pub fn wait_for_loader(&mut self, loader_id: &str, timeout_ms: u64) -> BrowserResult<()> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if self.current_loader_id()? == loader_id
+                && self
+                    .evaluate("document.readyState")?
+                    .as_str()
+                    .is_some_and(|state| matches!(state, "interactive" | "complete"))
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(BrowserError::new(
+                    "timeout",
+                    format!("timed out after {timeout_ms}ms waiting for the new document"),
+                )
+                .retryable());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub fn reset_network_idle_window(&mut self) {
+        self.network_idle_since = self.inflight_requests.is_empty().then(Instant::now);
+    }
+
+    pub fn network_idle_for(&self, duration: Duration) -> bool {
+        self.inflight_requests.is_empty()
+            && self
+                .network_idle_since
+                .is_some_and(|since| since.elapsed() >= duration)
+    }
+
     pub fn selector_candidates_script(selector: &Selector) -> String {
         match selector {
             Selector::Ref(reference) => format!(
@@ -299,10 +390,6 @@ impl Browser {
                 )
             }
         }
-    }
-
-    pub fn selector_script(selector: &Selector) -> String {
-        format!("({})[0]", Self::selector_candidates_script(selector))
     }
 
     pub fn element_eval(&mut self, selector: &Selector, body: &str) -> BrowserResult<Value> {
@@ -341,10 +428,54 @@ impl Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
+        if let Some(mut child) = self.child.take() {
+            // Let Chromium flush cookies and profile databases before falling
+            // back to a forced termination of an unresponsive process.
+            let _ = self.request_browser_close();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+fn terminate_failed_launch(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn update_network_activity(
+    inflight: &mut HashSet<String>,
+    idle_since: &mut Option<Instant>,
+    method: &str,
+    params: &Value,
+) {
+    match method {
+        "Network.requestWillBeSent" => {
+            if params["type"].as_str() != Some("WebSocket")
+                && let Some(id) = params["requestId"].as_str()
+            {
+                inflight.insert(id.to_owned());
+                *idle_since = None;
+            }
+        }
+        "Network.loadingFinished" | "Network.loadingFailed" => {
+            if let Some(id) = params["requestId"].as_str() {
+                inflight.remove(id);
+                if inflight.is_empty() {
+                    *idle_since = Some(Instant::now());
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -478,5 +609,36 @@ mod tests {
         assert!(script.contains("redacted:e.type==='password'"));
         assert!(script.contains("e.type==='password'?'password'"));
         assert!(script.contains("n>=200"));
+    }
+
+    #[test]
+    fn network_idle_tracks_requests_until_they_finish_or_fail() {
+        let mut inflight = HashSet::new();
+        let mut idle_since = Some(Instant::now());
+        update_network_activity(
+            &mut inflight,
+            &mut idle_since,
+            "Network.requestWillBeSent",
+            &json!({"requestId":"fetch-1","type":"Fetch"}),
+        );
+        assert!(inflight.contains("fetch-1"));
+        assert!(idle_since.is_none());
+
+        update_network_activity(
+            &mut inflight,
+            &mut idle_since,
+            "Network.loadingFinished",
+            &json!({"requestId":"fetch-1"}),
+        );
+        assert!(inflight.is_empty());
+        assert!(idle_since.is_some());
+
+        update_network_activity(
+            &mut inflight,
+            &mut idle_since,
+            "Network.requestWillBeSent",
+            &json!({"requestId":"socket-1","type":"WebSocket"}),
+        );
+        assert!(inflight.is_empty());
     }
 }

@@ -217,7 +217,9 @@ impl State {
                 executable,
                 headless,
             } => {
-                if self.browser.is_none() {
+                if let Some(browser) = self.browser.as_ref() {
+                    validate_open_mode(browser.child.is_some(), self.headless_owned, headless)?;
+                } else {
                     let paths = profile_paths(&self.profile)?;
                     let executable = browser_executable(executable.as_deref())?;
                     self.browser = Some(Browser::launch(&executable, &paths.user_data, headless)?);
@@ -226,7 +228,7 @@ impl State {
                 if let Some(url) = url {
                     navigate(self.browser()?, &url, 30_000)?;
                 }
-                Ok(json!({"opened":true,"headless":headless}))
+                Ok(json!({"opened":true,"headless":self.headless_owned}))
             }
             Command::Connect { endpoint } => {
                 if self.browser.is_some() {
@@ -239,7 +241,11 @@ impl State {
                 self.headless_owned = false;
                 Ok(json!({"connected":true,"owned":false}))
             }
-            Command::Status => Ok(json!({"running":self.browser.is_some()})),
+            Command::Status => Ok(json!({
+                "running":self.browser.is_some(),
+                "owned":self.browser.as_ref().is_some_and(|browser| browser.child.is_some()),
+                "headless":self.browser.as_ref().and_then(|browser| browser.child.as_ref().map(|_| self.headless_owned)),
+            })),
             Command::Close => {
                 self.browser.take();
                 self.should_exit = true;
@@ -259,9 +265,10 @@ impl State {
             }
             Command::Reload { timeout_ms } => {
                 let b = self.browser()?;
+                let previous_loader = b.current_loader_id()?;
                 b.call("Page.reload", json!({}))?;
                 b.document_id += 1;
-                b.wait_ready(timeout_ms)?;
+                wait_for_new_loader(b, &previous_loader, timeout_ms)?;
                 Ok(json!({"reloaded":true}))
             }
             Command::Snapshot {
@@ -304,12 +311,7 @@ impl State {
             Command::Hover { selector } => action(self.browser()?, &selector, Action::Hover),
             Command::Scroll { selector, x, y } => scroll(self.browser()?, selector.as_ref(), x, y),
             Command::Download { selector, output } => {
-                std::fs::create_dir_all(&output).map_err(io_error)?;
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700))
-                        .map_err(io_error)?;
-                }
+                prepare_download_directory(Path::new(&output))?;
                 let browser = self.browser()?;
                 browser.call_browser(
                     "Browser.setDownloadBehavior",
@@ -386,6 +388,34 @@ impl State {
     }
 }
 
+fn validate_open_mode(
+    owned: bool,
+    actual_headless: bool,
+    requested_headless: bool,
+) -> BrowserResult<()> {
+    if !owned {
+        return Err(BrowserError::new(
+            "browser_already_running",
+            "this profile is attached to an external browser; close it before opening an owned browser",
+        ));
+    }
+    if actual_headless != requested_headless {
+        return Err(BrowserError::new(
+            "browser_mode_mismatch",
+            format!(
+                "browser is already running in {} mode",
+                if actual_headless {
+                    "headless"
+                } else {
+                    "visible"
+                }
+            ),
+        )
+        .remedy("Close the profile before changing its browser mode."));
+    }
+    Ok(())
+}
+
 impl Browser {
     fn attach_first_available(&mut self) -> BrowserResult<()> {
         let tabs = self.tabs()?;
@@ -405,7 +435,13 @@ fn navigate(browser: &mut Browser, url: &str, timeout: u64) -> BrowserResult<()>
         return Err(BrowserError::new("navigation_failed", error));
     }
     browser.document_id += 1;
-    browser.wait_ready(timeout)
+    if let Some(loader_id) = result["loaderId"].as_str() {
+        browser.wait_for_loader(loader_id, timeout)
+    } else {
+        // Same-document navigations have no loader id and are committed before
+        // Page.navigate responds.
+        browser.wait_ready(timeout)
+    }
 }
 fn normalize_url(url: &str) -> BrowserResult<String> {
     let value = if url.contains("://") || url.starts_with("about:") || url.starts_with("data:") {
@@ -426,9 +462,45 @@ fn normalize_url(url: &str) -> BrowserResult<String> {
     Ok(value)
 }
 fn history(browser: &mut Browser, delta: i32, timeout: u64) -> BrowserResult<()> {
+    let previous_url = browser.url()?;
     browser.evaluate(&format!("history.go({delta})"))?;
     browser.document_id += 1;
-    browser.wait_ready(timeout)
+    let deadline = Instant::now() + Duration::from_millis(timeout);
+    loop {
+        if browser.url()? != previous_url {
+            return browser.wait_ready(timeout);
+        }
+        if Instant::now() >= deadline {
+            return Err(BrowserError::new(
+                "timeout",
+                format!("timed out after {timeout}ms waiting for history navigation"),
+            )
+            .retryable());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_new_loader(
+    browser: &mut Browser,
+    previous_loader: &str,
+    timeout: u64,
+) -> BrowserResult<()> {
+    let deadline = Instant::now() + Duration::from_millis(timeout);
+    loop {
+        let loader = browser.current_loader_id()?;
+        if !loader.is_empty() && loader != previous_loader {
+            return browser.wait_for_loader(&loader, timeout);
+        }
+        if Instant::now() >= deadline {
+            return Err(BrowserError::new(
+                "timeout",
+                format!("timed out after {timeout}ms waiting for the new document"),
+            )
+            .retryable());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 enum Action {
@@ -440,17 +512,18 @@ enum Action {
 }
 fn action(browser: &mut Browser, selector: &Selector, action: Action) -> BrowserResult<Value> {
     let is_click = matches!(action, Action::Click);
+    let is_hover = matches!(action, Action::Hover);
     let body=match action {
         Action::Click=>"if(e.disabled)throw new Error('element_disabled');e.scrollIntoView({block:'center'});return new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>{const r=e.getBoundingClientRect();let x=r.left+r.width/2,y=r.top+r.height/2,p=e.ownerDocument.elementFromPoint(x,y);if(!r.width||!r.height)throw new Error('element_not_visible');if(p!==e&&!e.contains(p))throw new Error('element_obscured');let w=e.ownerDocument.defaultView;while(w.frameElement){const f=w.frameElement.getBoundingClientRect();x+=f.left;y+=f.top;w=w.parent}resolve({x,y})})));".into(),
-        Action::Fill(v)=>format!("if(e.type==='password')throw new Error('password_field_denied');if(e.disabled)throw new Error('element_disabled');const r=e.getBoundingClientRect();if(!r.width||!r.height)throw new Error('element_not_visible');if(!('value'in e)&&!e.isContentEditable)throw new Error('element_not_editable');e.focus();if(e.isContentEditable)e.textContent={0};else{{const s=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value');if(s&&s.set)s.set.call(e,{0});else e.value={0}}}e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{0}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{filled:true}};",js_string(&v)),
+        Action::Fill(v)=>format!("if(e.type==='password')throw new Error('password_field_denied');if(e.disabled||e.readOnly)throw new Error('element_disabled');const r=e.getBoundingClientRect(),style=e.ownerDocument.defaultView.getComputedStyle(e);if(!r.width||!r.height||style.display==='none'||style.visibility!=='visible')throw new Error('element_not_visible');const input=e.matches('textarea,input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset]):not([type=file])');if(!input&&!e.isContentEditable)throw new Error('element_not_editable');e.focus();if(e.getRootNode().activeElement!==e)throw new Error('element_focus_failed');if(e.isContentEditable)e.textContent={0};else{{const s=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value');if(s&&s.set)s.set.call(e,{0});else e.value={0}}}e.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{0}}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{filled:true}};",js_string(&v)),
         Action::Select(values)=>format!("if(e.tagName!=='SELECT')throw new Error('element_not_select');const v=new Set({});for(const o of e.options)o.selected=v.has(o.value)||v.has(o.text);e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return {{selected:[...e.selectedOptions].map(o=>o.value)}};",serde_json::to_string(&values).unwrap()),
         Action::Check(checked)=>format!("if(!['checkbox','radio'].includes(e.type))throw new Error('element_not_checkable');if(e.checked!=={checked})e.click();return {{checked:e.checked}};"),
-        Action::Hover=>"e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect();e.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,clientX:r.left+r.width/2,clientY:r.top+r.height/2}));return {hovered:true};".into(),
+        Action::Hover=>"e.scrollIntoView({block:'center'});return new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>{const r=e.getBoundingClientRect();let x=r.left+r.width/2,y=r.top+r.height/2,p=e.ownerDocument.elementFromPoint(x,y);const s=e.ownerDocument.defaultView.getComputedStyle(e);if(!r.width||!r.height||s.display==='none'||s.visibility!=='visible')throw new Error('element_not_visible');if(p!==e&&!e.contains(p))throw new Error('element_obscured');let w=e.ownerDocument.defaultView;while(w.frameElement){const f=w.frameElement.getBoundingClientRect();x+=f.left;y+=f.top;w=w.parent}resolve({x,y})})));".into(),
     };
     let result = browser
         .element_eval(selector, &body)
         .map_err(classify_page_error)?;
-    if is_click {
+    if is_click || is_hover {
         let x = result["x"].as_f64().ok_or_else(|| {
             BrowserError::new("element_not_actionable", "element has no clickable center")
         })?;
@@ -461,6 +534,9 @@ fn action(browser: &mut Browser, selector: &Selector, action: Action) -> Browser
             "Input.dispatchMouseEvent",
             json!({"type":"mouseMoved","x":x,"y":y}),
         )?;
+        if is_hover {
+            return Ok(json!({"hovered":true}));
+        }
         browser.call(
             "Input.dispatchMouseEvent",
             json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1}),
@@ -480,7 +556,7 @@ fn type_text(
     value: &str,
     delay: u64,
 ) -> BrowserResult<Value> {
-    browser.element_eval(selector,"if(e.type==='password')throw new Error('password_field_denied');e.focus();return true;").map_err(classify_page_error)?;
+    browser.element_eval(selector,"if(e.type==='password')throw new Error('password_field_denied');if(e.disabled||e.readOnly)throw new Error('element_disabled');const r=e.getBoundingClientRect(),s=e.ownerDocument.defaultView.getComputedStyle(e);if(!r.width||!r.height||s.display==='none'||s.visibility!=='visible')throw new Error('element_not_visible');const input=e.matches('textarea,input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset]):not([type=file])');if(!input&&!e.isContentEditable)throw new Error('element_not_editable');e.focus();if(e.getRootNode().activeElement!==e)throw new Error('element_focus_failed');return true;").map_err(classify_page_error)?;
     for ch in value.chars() {
         browser.call("Input.insertText", json!({"text":ch.to_string()}))?;
         if delay > 0 {
@@ -551,11 +627,16 @@ fn wait(
     timeout: u64,
 ) -> BrowserResult<Value> {
     let deadline = Instant::now() + Duration::from_millis(timeout);
-    let mut network_sample: Option<(u64, Instant)> = None;
+    if matches!(load, Some(LoadState::Networkidle)) {
+        browser.reset_network_idle_window();
+    }
     loop {
         let matched = if let Some(s) = selector {
             browser
-                .evaluate(&format!("!!({})", Browser::selector_script(s)))?
+                .evaluate(&format!(
+                    "({}).some(e=>{{const r=e.getBoundingClientRect(),s=e.ownerDocument.defaultView.getComputedStyle(e);return e.isConnected&&r.width>0&&r.height>0&&s.display!=='none'&&s.visibility==='visible'}})",
+                    Browser::selector_candidates_script(s)
+                ))?
                 .as_bool()
                 .unwrap_or(false)
                 != hidden
@@ -579,19 +660,7 @@ fn wait(
                 LoadState::Load => ready == "complete",
                 LoadState::Domcontentloaded => matches!(ready.as_str(), "interactive" | "complete"),
                 LoadState::Networkidle => {
-                    let count = browser
-                        .evaluate("performance.getEntriesByType('resource').length")?
-                        .as_u64()
-                        .unwrap_or(0);
-                    match network_sample {
-                        Some((previous, since)) if previous == count => {
-                            ready == "complete" && since.elapsed() >= Duration::from_millis(500)
-                        }
-                        _ => {
-                            network_sample = Some((count, Instant::now()));
-                            false
-                        }
-                    }
+                    ready == "complete" && browser.network_idle_for(Duration::from_millis(500))
                 }
             }
         } else {
@@ -632,19 +701,52 @@ fn screenshot(browser: &mut Browser, output: &str, full_page: bool) -> BrowserRe
     {
         std::fs::create_dir_all(parent).map_err(io_error)?;
     }
-    {
-        use std::fs::OpenOptions;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(output)
-            .map_err(io_error)?;
-        file.write_all(&bytes).map_err(io_error)?;
-    }
+    write_private_file(Path::new(output), &bytes)?;
     Ok(json!({"path":output,"bytes":bytes.len()}))
+}
+fn write_private_file(path: &Path, bytes: &[u8]) -> BrowserResult<()> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(io_error)?;
+    file.write_all(bytes).map_err(io_error)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(io_error)
+}
+fn prepare_download_directory(path: &Path) -> BrowserResult<()> {
+    if path.exists() {
+        if path.is_dir() {
+            return Ok(());
+        }
+        return Err(BrowserError::new(
+            "invalid_output_path",
+            format!("download output {} is not a directory", path.display()),
+        ));
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    match std::fs::create_dir(path) {
+        Ok(()) => {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .map_err(io_error)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {
+            // Another caller won the race. The directory is caller-owned, so
+            // preserve its permissions exactly as for any pre-existing path.
+        }
+        Err(error) => return Err(io_error(error)),
+    }
+    Ok(())
 }
 fn resolve_tab(tabs: &[Value], target: &str) -> BrowserResult<String> {
     if let Ok(index) = target.parse::<usize>() {
@@ -690,6 +792,11 @@ fn classify_page_error(mut error: BrowserError) -> BrowserError {
             "element is not editable",
         ),
         (
+            "element_focus_failed",
+            "element_not_actionable",
+            "element could not receive focus",
+        ),
+        (
             "element_detached",
             "element_stale",
             "element is detached; take a fresh snapshot",
@@ -712,6 +819,7 @@ fn protocol(e: impl std::fmt::Display) -> BrowserError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     #[ignore = "requires local Unix socket capability"]
@@ -729,5 +837,66 @@ mod tests {
         let closed = client.request(Command::Close).unwrap();
         assert!(closed.ok);
         handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn existing_download_directories_keep_their_permissions() {
+        let path = std::env::temp_dir().join(format!(
+            "desktop-browser-existing-download-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_download_directory(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn newly_created_download_directories_are_private() {
+        let path = std::env::temp_dir().join(format!(
+            "desktop-browser-new-download-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        prepare_download_directory(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn overwriting_a_screenshot_tightens_existing_permissions() {
+        let path = std::env::temp_dir().join(format!(
+            "desktop-browser-existing-screenshot-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_file(&path, b"private image").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"private image");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn reopening_a_profile_refuses_mode_changes_and_external_attachments() {
+        assert!(validate_open_mode(true, true, true).is_ok());
+        assert_eq!(
+            validate_open_mode(true, true, false).unwrap_err().code,
+            "browser_mode_mismatch"
+        );
+        assert_eq!(
+            validate_open_mode(false, false, false).unwrap_err().code,
+            "browser_already_running"
+        );
     }
 }
