@@ -111,7 +111,7 @@ pub enum Command {
     #[command(subcommand)]
     Session(SessionCommand),
 
-    /// Navigate and automate Chromium with browser-native semantics.
+    /// Navigate and automate Chromium or Firefox with browser-native semantics.
     #[command(subcommand)]
     Browser(BrowserCommand),
 
@@ -134,7 +134,7 @@ pub enum BrowserCommand {
     Doctor(BrowserProfileArgs),
     /// Start a managed browser and optionally navigate.
     Open(BrowserOpenArgs),
-    /// Attach to an existing loopback CDP HTTP or WebSocket endpoint.
+    /// Attach to an existing loopback CDP or WebDriver BiDi endpoint.
     Connect(BrowserConnectArgs),
     /// Show managed browser state.
     Status(BrowserProfileArgs),
@@ -198,6 +198,9 @@ pub struct BrowserOpenArgs {
     pub profile: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub executable: Option<String>,
+    /// Browser engine to automate.
+    #[arg(long, value_enum, default_value_t = BrowserEngineArg::Chromium)]
+    pub browser: BrowserEngineArg,
     /// Run without a watchable browser window.
     #[arg(long)]
     pub headless: bool,
@@ -208,6 +211,16 @@ pub struct BrowserConnectArgs {
     pub endpoint: String,
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
+    /// Protocol exposed by the endpoint.
+    #[arg(long, value_enum, default_value_t = BrowserEngineArg::Chromium)]
+    pub browser: BrowserEngineArg,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum BrowserEngineArg {
+    #[default]
+    Chromium,
+    Firefox,
 }
 
 #[derive(Debug, Args)]
@@ -728,6 +741,15 @@ mod tests {
                 "browser",
                 "open",
                 "https://example.com",
+                "--headless",
+            ],
+            &[
+                "desktop",
+                "browser",
+                "open",
+                "https://example.com",
+                "--browser",
+                "firefox",
                 "--headless",
             ],
             &["desktop", "browser", "snapshot", "-i"],

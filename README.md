@@ -22,7 +22,7 @@ desktop click --role button --name "7"
 
 Every command takes `--json`.
 
-For web pages, the same binary now has a browser-native CDP surface:
+For web pages, the same binary has a browser-native CDP/WebDriver BiDi surface:
 
 ```bash
 desktop browser open https://example.com --headless
@@ -63,15 +63,18 @@ stack — see [Sharing a desktop with a human](#sharing-a-desktop-with-a-human).
 
 ## Browser-native automation
 
-`desktop browser` is the page-navigation path for Chromium. It uses the Chrome DevTools Protocol
-directly—there is no Node, Playwright, embedded model, MCP server, or hidden selector guessing. A
-small local daemon owns the CDP connection for each profile so separate CLI calls share tabs,
-cookies and a document-scoped ref map.
+`desktop browser` is the page-navigation path for Chromium and Firefox. It uses the Chrome
+DevTools Protocol for Chromium and WebDriver BiDi for Firefox directly—there is no Node,
+Playwright, Selenium, embedded model, MCP server, or hidden selector guessing. A small local daemon
+owns the protocol connection for each profile so separate CLI calls share tabs, cookies and a
+document-scoped ref map.
 
 ```bash
 desktop browser doctor
 desktop browser install                         # only when no Chrome/Chromium is found
 desktop browser open https://example.com --headless
+# Or choose Firefox once when opening the profile:
+desktop browser open https://example.com --browser firefox --headless
 desktop browser snapshot -i                     # compact interactive snapshot
 desktop browser fill @e2 "Evandro"
 desktop browser click @e3
@@ -82,8 +85,9 @@ desktop browser close
 
 Targets are `@eN`, `css=...`, `xpath=...`, `text=...`, `--role/--name`, `--label`, or
 `--test-id`. Actions require one strategy and one match. Clicks wait two animation frames, verify
-visibility and hit testing, scroll into view, then dispatch CDP pointer events. Navigation and
-fresh snapshots replace refs; take another snapshot instead of reusing a stale page reference.
+visibility and hit testing, scroll into view, then dispatch native protocol pointer events.
+Navigation and fresh snapshots replace refs; take another snapshot instead of reusing a stale page
+reference.
 
 The namespace also provides history/reload, `get text|html|value|attr|title|url|count`,
 fill/type/press/select/check/hover/scroll, condition waits, screenshots, tabs, JavaScript dialog
@@ -101,13 +105,15 @@ desktop browser open https://github.com --profile github
 The user enters passwords, passkeys and one-time codes directly in that visible browser. Agents
 must never request or type them. Password values are redacted and browser fill/type refuses those
 fields. The profile keeps cookies for later runs. Headless operation is explicit with `--headless`.
-Attaching to an existing browser is loopback-only:
+Attaching to an existing browser is loopback-only. Select Firefox for a Remote Agent endpoint:
 
 ```bash
 desktop browser connect http://127.0.0.1:9222
+desktop browser connect ws://127.0.0.1:9223/session --browser firefox
 ```
 
-Use ordinary `desktop snapshot/click/type` for browser chrome, Firefox, and desktop applications.
+Use ordinary `desktop snapshot/click/type` for browser chrome and desktop applications. Use
+`desktop browser` for page content in either supported engine.
 
 ---
 
@@ -631,7 +637,7 @@ desktop key   "cmd+s"
 desktop scroll --y -500
 
 desktop browser doctor
-desktop browser open [URL] [--headless] [--profile NAME] [--executable PATH]
+desktop browser open [URL] [--browser chromium|firefox] [--headless] [--profile NAME] [--executable PATH]
 desktop browser snapshot [-i | --all] [--max-nodes N]
 desktop browser goto URL | back | forward | reload
 desktop browser click TARGET
@@ -751,7 +757,7 @@ signal something it did not start.
 ```
 crates/
 ├── desktop-core     models · ports · snapshot · selectors · policy · errors
-├── desktop-browser  CDP transport · daemon · profiles · page automation
+├── desktop-browser  CDP + WebDriver BiDi · daemon · profiles · page automation
 ├── desktop-linux    AT-SPI · X11/XTEST · xdg-desktop-portal
 ├── desktop-macos    AXUIElement · CGWindowList · ScreenCaptureKit · CGEvent
 └── desktop-cli      the `desktop` binary
@@ -808,8 +814,8 @@ cargo test --workspace -- --ignored
 
 ## Not in this version
 
-MCP server, OCR, visual reasoning, remote control over a network, Windows, Firefox-native
-automation, arbitrary page-script execution, recording and replay.
+MCP server, OCR, visual reasoning, remote control over a network, Windows, arbitrary page-script
+execution, recording and replay.
 
 ## Contributing
 

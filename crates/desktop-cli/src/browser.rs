@@ -2,15 +2,17 @@
 
 use std::{io::Read as _, process::Command as ProcessCommand};
 
-use desktop_browser::{BrowserError, Client, Command, GetKind, LoadState, Response, Selector};
+use desktop_browser::{
+    BrowserEngine, BrowserError, Client, Command, GetKind, LoadState, Response, Selector,
+};
 use desktop_core::{SessionHost, errors::ExitCategory};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
     cli::{
-        BrowserCommand, BrowserDialogCommand, BrowserGetCommand, BrowserLoadArg, BrowserTabCommand,
-        BrowserTargetArgs, Cli,
+        BrowserCommand, BrowserDialogCommand, BrowserEngineArg, BrowserGetCommand, BrowserLoadArg,
+        BrowserTabCommand, BrowserTargetArgs, Cli,
     },
     output::Sink,
 };
@@ -33,6 +35,7 @@ pub fn run(
                 }
                 "element_not_found"
                 | "element_not_actionable"
+                | "browser_engine_mismatch"
                 | "browser_mode_mismatch"
                 | "invalid_output_path"
                 | "tab_gone"
@@ -70,20 +73,38 @@ fn execute(
             "--read-only refuses this browser command",
         ));
     }
+    let selected_engine = match &wire {
+        Command::Open { engine, .. } | Command::Connect { engine, .. } => *engine,
+        _ if client.is_running() => client
+            .request(Command::Status)
+            .ok()
+            .and_then(|response| response.result)
+            .and_then(|result| match result["browser"].as_str() {
+                Some("firefox") => Some(BrowserEngine::Firefox),
+                Some("chromium") => Some(BrowserEngine::Chromium),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        _ => BrowserEngine::default(),
+    };
     let names_browser = |name: &str| {
         let name = name.to_ascii_lowercase();
-        name.contains("chrome") || name.contains("chromium") || name == "browser"
+        name == "browser"
+            || match selected_engine {
+                BrowserEngine::Chromium => name.contains("chrome") || name.contains("chromium"),
+                BrowserEngine::Firefox => name.contains("firefox"),
+            }
     };
     if cli.deny_app.iter().any(|name| names_browser(name)) {
         return Err(BrowserError::new(
             "policy_denied",
-            "--deny-app refuses Chromium browser automation",
+            "--deny-app refuses browser-native automation",
         ));
     }
     if !cli.allow_app.is_empty() && !cli.allow_app.iter().any(|name| names_browser(name)) {
         return Err(BrowserError::new(
             "policy_denied",
-            "Chromium is outside the --allow-app list",
+            "the selected browser is outside the --allow-app list",
         ));
     }
     if let Some(role) = selector_role(&wire)
@@ -181,9 +202,11 @@ fn command_to_wire(command: &BrowserCommand) -> Result<Command, BrowserError> {
             url: a.url.clone(),
             executable: a.executable.clone(),
             headless: a.headless,
+            engine: engine(a.browser),
         },
         BrowserCommand::Connect(a) => Command::Connect {
             endpoint: a.endpoint.clone(),
+            engine: engine(a.browser),
         },
         BrowserCommand::Status(_) => Command::Status,
         BrowserCommand::Close(_) => Command::Close,
@@ -341,6 +364,13 @@ fn command_to_wire(command: &BrowserCommand) -> Result<Command, BrowserError> {
             ));
         }
     })
+}
+
+fn engine(value: BrowserEngineArg) -> BrowserEngine {
+    match value {
+        BrowserEngineArg::Chromium => BrowserEngine::Chromium,
+        BrowserEngineArg::Firefox => BrowserEngine::Firefox,
+    }
 }
 
 fn selector(a: &BrowserTargetArgs) -> Result<Selector, BrowserError> {
@@ -515,10 +545,11 @@ fn doctor(
     let active = sessions.status();
     let profile = desktop_browser::profile_name(profile, active.as_ref().map(|s| s.name.as_str()))?;
     let client = Client::new(&profile)?;
-    let executable = desktop_browser::browser_executable(None).ok();
+    let chromium = desktop_browser::browser_executable(BrowserEngine::Chromium, None).ok();
+    let firefox = desktop_browser::browser_executable(BrowserEngine::Firefox, None).ok();
     render_value(
         sink,
-        &json!({"ok":executable.is_some(),"profile":profile,"browser":executable.as_ref().map(|p|p.display().to_string()),"daemon_running":client.is_running(),"session":active.map(|s|json!({"name":s.name,"display":s.display,"visible":s.visible})),"remedy":if executable.is_none(){Some("Run `desktop browser install` or pass --executable to `browser open`.")}else{None}}),
+        &json!({"ok":chromium.is_some()||firefox.is_some(),"profile":profile,"browsers":{"chromium":chromium.as_ref().map(|p|p.display().to_string()),"firefox":firefox.as_ref().map(|p|p.display().to_string())},"daemon_running":client.is_running(),"session":active.map(|s|json!({"name":s.name,"display":s.display,"visible":s.visible})),"remedy":if chromium.is_none()&&firefox.is_none(){Some("Install Firefox or run `desktop browser install` for Chromium.")}else{None}}),
     )
 }
 

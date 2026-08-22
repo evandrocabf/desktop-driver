@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Deterministic Chromium automation for desktop-driver."
+description = "Deterministic Chromium and Firefox automation for desktop-driver."
 
 [dependencies]
 base64.workspace = true
@@ -14,3 +14,4 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tungstenite.workspace = true
+rustix.workspace = true

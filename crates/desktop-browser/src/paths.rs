@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use crate::{BrowserError, BrowserResult};
+use crate::{BrowserEngine, BrowserError, BrowserResult};
 
 #[derive(Clone, Debug)]
 pub struct ProfilePaths {
     pub socket: PathBuf,
     pub user_data: PathBuf,
+    pub firefox_user_data: PathBuf,
     pub downloads: PathBuf,
 }
 
@@ -53,25 +54,25 @@ pub fn profile_paths(profile: &str) -> BrowserResult<ProfilePaths> {
                 .and_then(Path::file_name)
                 .is_some_and(|name| name == "sessions")
     });
-    let base = if inside_matching_session {
-        inherited_home
-            .unwrap()
-            .join(".config/desktop-driver/chromium")
+    let browser_root = if inside_matching_session {
+        inherited_home.unwrap().join(".config/desktop-driver")
     } else {
         data.join("desktop-driver/sessions")
             .join(profile)
-            .join("home/.config/desktop-driver/chromium")
+            .join("home/.config/desktop-driver")
     };
+    let base = browser_root.join("chromium");
     Ok(ProfilePaths {
         socket: runtime
             .join("desktop-driver/browser")
             .join(format!("{profile}.sock")),
         downloads: base.join("Downloads"),
         user_data: base,
+        firefox_user_data: browser_root.join("firefox"),
     })
 }
 
-pub fn browser_executable(explicit: Option<&str>) -> BrowserResult<PathBuf> {
+pub fn browser_executable(engine: BrowserEngine, explicit: Option<&str>) -> BrowserResult<PathBuf> {
     if let Some(path) = explicit {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -82,20 +83,29 @@ pub fn browser_executable(explicit: Option<&str>) -> BrowserResult<PathBuf> {
             format!("browser executable does not exist: {}", path.display()),
         ));
     }
-    let installed = installed_browser_path();
-    if installed.is_file() {
-        return Ok(installed);
+    if engine == BrowserEngine::Chromium {
+        let installed = installed_browser_path();
+        if installed.is_file() {
+            return Ok(installed);
+        }
     }
-    for name in browser_names() {
+    for name in browser_names(engine) {
         if let Some(path) = find_in_path(name) {
             return Ok(path);
         }
     }
     Err(BrowserError::new(
         "browser_not_found",
-        "no compatible Chromium browser was found",
+        format!("no compatible {} browser was found", engine.as_str()),
     )
-    .remedy("Install Chrome/Chromium, pass --executable, or run `desktop browser install`."))
+    .remedy(match engine {
+        BrowserEngine::Chromium => {
+            "Install Chrome/Chromium, pass --executable, or run `desktop browser install`."
+        }
+        BrowserEngine::Firefox => {
+            "Install Firefox or pass --executable to `desktop browser open --browser firefox`."
+        }
+    }))
 }
 
 pub fn installed_browser_path() -> PathBuf {
@@ -111,22 +121,28 @@ pub fn installed_browser_path() -> PathBuf {
     data.join("desktop-driver/browsers/chrome-for-testing/chrome-linux64/chrome")
 }
 
-fn browser_names() -> &'static [&'static str] {
+fn browser_names(engine: BrowserEngine) -> &'static [&'static str] {
     #[cfg(target_os = "macos")]
     {
-        &[
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
+        match engine {
+            BrowserEngine::Chromium => &[
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ],
+            BrowserEngine::Firefox => &["/Applications/Firefox.app/Contents/MacOS/firefox"],
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        &[
-            "google-chrome",
-            "google-chrome-stable",
-            "chromium",
-            "chromium-browser",
-        ]
+        match engine {
+            BrowserEngine::Chromium => &[
+                "google-chrome",
+                "google-chrome-stable",
+                "chromium",
+                "chromium-browser",
+            ],
+            BrowserEngine::Firefox => &["firefox", "firefox-esr"],
+        }
     }
 }
 
@@ -162,5 +178,13 @@ mod tests {
     fn active_session_is_the_default_profile() {
         assert_eq!(profile_name(None, Some("work")).unwrap(), "work");
         assert_eq!(profile_name(None, None).unwrap(), "default");
+    }
+
+    #[test]
+    fn firefox_and_chromium_profiles_do_not_share_browser_state() {
+        let paths = profile_paths("engine-isolation").unwrap();
+        assert_ne!(paths.user_data, paths.firefox_user_data);
+        assert!(paths.user_data.ends_with("chromium"));
+        assert!(paths.firefox_user_data.ends_with("firefox"));
     }
 }
