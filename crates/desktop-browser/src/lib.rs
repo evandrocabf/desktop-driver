@@ -19,7 +19,8 @@ pub use model::{
     Selector,
 };
 pub use paths::{
-    browser_executable, installed_browser_path as installed_path, profile_name, profile_paths,
+    browser_executable, installed_browser_path as installed_path, profile_engine, profile_name,
+    profile_paths, save_profile_engine,
 };
 
 pub fn daemon_wait(profile: &str) -> BrowserResult<()> {

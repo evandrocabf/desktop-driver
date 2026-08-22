@@ -40,6 +40,8 @@ pub fn run(
                 | "invalid_output_path"
                 | "tab_gone"
                 | "invalid_url"
+                | "invalid_key"
+                | "invalid_profile_engine"
                 | "invalid_profile" => ExitCategory::TargetFailure,
                 _ => ExitCategory::BackendFailure,
             }
@@ -66,27 +68,14 @@ fn execute(
         desktop_browser::profile_name(explicit, active.as_ref().map(|s| s.name.as_str()))?;
     let client = Client::new(&profile)?;
 
-    let wire = command_to_wire(command)?;
+    let selected_engine = resolve_engine(command, &profile, &client)?;
+    let wire = command_to_wire(command, selected_engine)?;
     if cli.read_only && wire.mutates() {
         return Err(BrowserError::new(
             "policy_denied",
             "--read-only refuses this browser command",
         ));
     }
-    let selected_engine = match &wire {
-        Command::Open { engine, .. } | Command::Connect { engine, .. } => *engine,
-        _ if client.is_running() => client
-            .request(Command::Status)
-            .ok()
-            .and_then(|response| response.result)
-            .and_then(|result| match result["browser"].as_str() {
-                Some("firefox") => Some(BrowserEngine::Firefox),
-                Some("chromium") => Some(BrowserEngine::Chromium),
-                _ => None,
-            })
-            .unwrap_or_default(),
-        _ => BrowserEngine::default(),
-    };
     let names_browser = |name: &str| {
         let name = name.to_ascii_lowercase();
         name == "browser"
@@ -196,17 +185,20 @@ fn start_daemon(
     desktop_browser::spawn_daemon(&exe, profile)
 }
 
-fn command_to_wire(command: &BrowserCommand) -> Result<Command, BrowserError> {
+fn command_to_wire(
+    command: &BrowserCommand,
+    selected_engine: BrowserEngine,
+) -> Result<Command, BrowserError> {
     Ok(match command {
         BrowserCommand::Open(a) => Command::Open {
             url: a.url.clone(),
             executable: a.executable.clone(),
             headless: a.headless,
-            engine: engine(a.browser),
+            engine: selected_engine,
         },
         BrowserCommand::Connect(a) => Command::Connect {
             endpoint: a.endpoint.clone(),
-            engine: engine(a.browser),
+            engine: selected_engine,
         },
         BrowserCommand::Status(_) => Command::Status,
         BrowserCommand::Close(_) => Command::Close,
@@ -364,6 +356,45 @@ fn command_to_wire(command: &BrowserCommand) -> Result<Command, BrowserError> {
             ));
         }
     })
+}
+
+fn resolve_engine(
+    command: &BrowserCommand,
+    profile: &str,
+    client: &Client,
+) -> Result<BrowserEngine, BrowserError> {
+    let explicit = match command {
+        BrowserCommand::Open(args) => args.browser,
+        BrowserCommand::Connect(args) => args.browser,
+        _ => None,
+    };
+    if let Some(explicit) = explicit {
+        return Ok(engine(explicit));
+    }
+    if client.is_running()
+        && let Ok(response) = client.request(Command::Status)
+        && let Some(name) = response
+            .result
+            .as_ref()
+            .and_then(|result| result["browser"].as_str())
+    {
+        return match name {
+            "chromium" => Ok(BrowserEngine::Chromium),
+            "firefox" => Ok(BrowserEngine::Firefox),
+            _ => Err(BrowserError::new(
+                "invalid_profile_engine",
+                format!("running browser reported unknown engine {name:?}"),
+            )),
+        };
+    }
+    if matches!(
+        command,
+        BrowserCommand::Open(_) | BrowserCommand::Connect(_)
+    ) {
+        Ok(desktop_browser::profile_engine(profile)?.unwrap_or_default())
+    } else {
+        Ok(BrowserEngine::default())
+    }
 }
 
 fn engine(value: BrowserEngineArg) -> BrowserEngine {

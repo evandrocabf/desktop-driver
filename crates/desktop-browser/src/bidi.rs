@@ -471,8 +471,8 @@ impl Browser {
     }
 
     fn key(&mut self, key: &str) -> BrowserResult<Value> {
-        let value = webdriver_key(key);
-        self.type_chars(value)
+        let value = webdriver_key(key)?;
+        self.type_chars(&value)
     }
 }
 
@@ -568,19 +568,95 @@ fn normalize_endpoint(endpoint: &str) -> BrowserResult<String> {
     Ok(value)
 }
 
-fn webdriver_key(key: &str) -> &str {
-    match key.to_ascii_lowercase().as_str() {
-        "enter" => "\u{e007}",
-        "tab" => "\u{e004}",
-        "escape" | "esc" => "\u{e00c}",
-        "backspace" => "\u{e003}",
-        "delete" => "\u{e017}",
-        "arrowup" => "\u{e013}",
-        "arrowdown" => "\u{e015}",
-        "arrowleft" => "\u{e012}",
-        "arrowright" => "\u{e014}",
-        _ => key,
+fn webdriver_key(key: &str) -> BrowserResult<String> {
+    if key.chars().count() == 1 {
+        return Ok(key.to_owned());
     }
+    let normalized: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let value = match normalized.as_str() {
+        "null" | "unidentified" => '\u{e000}',
+        "cancel" => '\u{e001}',
+        "help" => '\u{e002}',
+        "backspace" => '\u{e003}',
+        "tab" => '\u{e004}',
+        "clear" => '\u{e005}',
+        "return" => '\u{e006}',
+        "enter" | "numpadenter" => '\u{e007}',
+        "shift" | "shiftleft" => '\u{e008}',
+        "control" | "ctrl" | "controlleft" | "ctrlleft" => '\u{e009}',
+        "alt" | "option" | "altleft" | "optionleft" => '\u{e00a}',
+        "pause" => '\u{e00b}',
+        "escape" | "esc" => '\u{e00c}',
+        "space" | "spacebar" => '\u{e00d}',
+        "pageup" | "pgup" => '\u{e00e}',
+        "pagedown" | "pgdown" | "pgdn" => '\u{e00f}',
+        "end" => '\u{e010}',
+        "home" => '\u{e011}',
+        "arrowleft" | "left" => '\u{e012}',
+        "arrowup" | "up" => '\u{e013}',
+        "arrowright" | "right" => '\u{e014}',
+        "arrowdown" | "down" => '\u{e015}',
+        "insert" => '\u{e016}',
+        "delete" | "del" => '\u{e017}',
+        "semicolon" => '\u{e018}',
+        "equals" | "equal" | "numpadequal" | "numpadequals" => '\u{e019}',
+        "numpad0" => '\u{e01a}',
+        "numpad1" => '\u{e01b}',
+        "numpad2" => '\u{e01c}',
+        "numpad3" => '\u{e01d}',
+        "numpad4" => '\u{e01e}',
+        "numpad5" => '\u{e01f}',
+        "numpad6" => '\u{e020}',
+        "numpad7" => '\u{e021}',
+        "numpad8" => '\u{e022}',
+        "numpad9" => '\u{e023}',
+        "multiply" | "numpadmultiply" => '\u{e024}',
+        "add" | "numpadadd" => '\u{e025}',
+        "separator" | "numpadcomma" | "numpadseparator" => '\u{e026}',
+        "subtract" | "numpadsubtract" => '\u{e027}',
+        "decimal" | "numpaddecimal" => '\u{e028}',
+        "divide" | "numpaddivide" => '\u{e029}',
+        "f1" => '\u{e031}',
+        "f2" => '\u{e032}',
+        "f3" => '\u{e033}',
+        "f4" => '\u{e034}',
+        "f5" => '\u{e035}',
+        "f6" => '\u{e036}',
+        "f7" => '\u{e037}',
+        "f8" => '\u{e038}',
+        "f9" => '\u{e039}',
+        "f10" => '\u{e03a}',
+        "f11" => '\u{e03b}',
+        "f12" => '\u{e03c}',
+        "meta" | "command" | "cmd" | "super" | "metaleft" => '\u{e03d}',
+        "zenkakuhankaku" => '\u{e040}',
+        "shiftright" => '\u{e050}',
+        "controlright" | "ctrlright" => '\u{e051}',
+        "altright" | "optionright" => '\u{e052}',
+        "metaright" | "commandright" | "cmdright" | "superright" => '\u{e053}',
+        "numpadpageup" => '\u{e054}',
+        "numpadpagedown" => '\u{e055}',
+        "numpadend" => '\u{e056}',
+        "numpadhome" => '\u{e057}',
+        "numpadarrowleft" => '\u{e058}',
+        "numpadarrowup" => '\u{e059}',
+        "numpadarrowright" => '\u{e05a}',
+        "numpadarrowdown" => '\u{e05b}',
+        "numpadinsert" => '\u{e05c}',
+        "numpaddelete" => '\u{e05d}',
+        _ => {
+            return Err(BrowserError::new(
+                "invalid_key",
+                format!("unknown Firefox key name {key:?}"),
+            )
+            .remedy("Use one character or a WebDriver key name such as Enter, Space, Home, PageDown, F1, Control, or Meta."));
+        }
+    };
+    Ok(value.to_string())
 }
 
 fn timeout(ms: u64, what: &str) -> BrowserError {
@@ -642,5 +718,22 @@ mod tests {
             remote_value(&value).unwrap(),
             json!({"name":"fox","items":[2]})
         );
+    }
+
+    #[test]
+    fn maps_named_webdriver_keys_instead_of_typing_their_names() {
+        for (name, expected) in [
+            ("Home", '\u{e011}'),
+            ("PageDown", '\u{e00f}'),
+            ("Space", '\u{e00d}'),
+            ("F1", '\u{e031}'),
+            ("Control", '\u{e009}'),
+            ("ShiftRight", '\u{e050}'),
+            ("Numpad9", '\u{e023}'),
+        ] {
+            assert_eq!(webdriver_key(name).unwrap(), expected.to_string());
+        }
+        assert_eq!(webdriver_key("x").unwrap(), "x");
+        assert_eq!(webdriver_key("NotAKey").unwrap_err().code, "invalid_key");
     }
 }

@@ -199,8 +199,8 @@ pub struct BrowserOpenArgs {
     #[arg(long, value_name = "PATH")]
     pub executable: Option<String>,
     /// Browser engine to automate.
-    #[arg(long, value_enum, default_value_t = BrowserEngineArg::Chromium)]
-    pub browser: BrowserEngineArg,
+    #[arg(long, value_enum)]
+    pub browser: Option<BrowserEngineArg>,
     /// Run without a watchable browser window.
     #[arg(long)]
     pub headless: bool,
@@ -212,8 +212,8 @@ pub struct BrowserConnectArgs {
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
     /// Protocol exposed by the endpoint.
-    #[arg(long, value_enum, default_value_t = BrowserEngineArg::Chromium)]
-    pub browser: BrowserEngineArg,
+    #[arg(long, value_enum)]
+    pub browser: Option<BrowserEngineArg>,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -690,6 +690,29 @@ mod tests {
     #[test]
     fn the_command_tree_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn browser_engine_is_optional_but_explicit_firefox_is_preserved() {
+        let omitted = Cli::try_parse_from(["desktop", "browser", "open", "example.com"]).unwrap();
+        let Command::Browser(BrowserCommand::Open(omitted)) = omitted.command else {
+            panic!("expected browser open")
+        };
+        assert!(omitted.browser.is_none());
+
+        let explicit = Cli::try_parse_from([
+            "desktop",
+            "browser",
+            "open",
+            "example.com",
+            "--browser",
+            "firefox",
+        ])
+        .unwrap();
+        let Command::Browser(BrowserCommand::Open(explicit)) = explicit.command else {
+            panic!("expected browser open")
+        };
+        assert!(matches!(explicit.browser, Some(BrowserEngineArg::Firefox)));
     }
 
     #[test]

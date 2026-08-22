@@ -19,7 +19,7 @@ use crate::{
     Selector,
     backend::Browser,
     cdp::{js_string, snapshot_script},
-    paths::{browser_executable, profile_paths},
+    paths::{browser_executable, profile_paths, save_profile_engine},
 };
 
 #[derive(Clone, Debug)]
@@ -221,6 +221,9 @@ impl State {
             } => {
                 if let Some(browser) = self.browser.as_ref() {
                     validate_open(browser, self.headless_owned, headless, engine)?;
+                    // Repair profiles created before engine markers existed,
+                    // using the live daemon as the source of truth.
+                    save_profile_engine(&self.profile, engine)?;
                 } else {
                     let paths = profile_paths(&self.profile)?;
                     let executable = browser_executable(engine, executable.as_deref())?;
@@ -228,7 +231,12 @@ impl State {
                         BrowserEngine::Chromium => &paths.user_data,
                         BrowserEngine::Firefox => &paths.firefox_user_data,
                     };
-                    self.browser = Some(Browser::launch(engine, &executable, profile, headless)?);
+                    let browser = Browser::launch(engine, &executable, profile, headless)?;
+                    if let Err(error) = save_profile_engine(&self.profile, engine) {
+                        drop(browser);
+                        return Err(error);
+                    }
+                    self.browser = Some(browser);
                     self.headless_owned = headless;
                 }
                 if let Some(url) = url {
@@ -243,7 +251,12 @@ impl State {
                         "close the current browser before connecting",
                     ));
                 }
-                self.browser = Some(Browser::connect(engine, &endpoint)?);
+                let browser = Browser::connect(engine, &endpoint)?;
+                if let Err(error) = save_profile_engine(&self.profile, engine) {
+                    drop(browser);
+                    return Err(error);
+                }
+                self.browser = Some(browser);
                 self.headless_owned = false;
                 Ok(json!({"connected":true,"owned":false}))
             }
