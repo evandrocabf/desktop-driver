@@ -408,7 +408,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "desktop-browser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "ctrlc",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "desktop-browser",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "schemars",
  "serde",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-linux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ashpd",
  "atspi",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-macos"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "block2",
  "desktop-core",
@@ -1627,7 +1627,7 @@ checksum = "acf4d1bc32aa46eec18caa634ec3cf4c05bfa151f12b93b510b15190f69a1ca8"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "zbus"

@@ -452,12 +452,11 @@ that the replacement binary reports the same version as the fetched source
 before replacing the installed executable, and leaves persistent browser
 profiles outside the checkout untouched.
 
-Version `0.1.0` is the first release. Releases are built by
+Version `0.1.0` was the first release; the current source version is `0.2.0`. Releases are built by
 `.github/workflows/release.yml` when a matching `v*` tag is pushed:
 static musl binaries for x86_64 and aarch64 Linux, and both macOS
-architectures, each with a `.sha256` beside it. Until the `v0.1.0` tag exists there are no
-assets to download and every install compiles — which is the same thing the
-installer does on any platform the matrix does not cover.
+architectures, each with a `.sha256` beside it. When a matching release asset does not exist, the
+installer compiles from source — the same fallback used on platforms the matrix does not cover.
 
 Or build it yourself — Rust 1.97.1, pinned in `rust-toolchain.toml`:
 
