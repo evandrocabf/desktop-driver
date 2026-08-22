@@ -125,6 +125,8 @@ fn start_daemon(
     sessions: &dyn SessionHost,
 ) -> Result<(), BrowserError> {
     let exe = std::env::current_exe().map_err(io_error)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = (headless, sessions);
     #[cfg(target_os = "linux")]
     if !headless {
         let active = sessions.status().ok_or_else(|| {
