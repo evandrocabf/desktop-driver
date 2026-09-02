@@ -70,9 +70,23 @@ pub struct ResolvedTree {
 pub enum CaptureTarget {
     Screen,
     Window(WindowId),
+    /// The frontmost ordinary window owned by the named application.
+    App(String),
 }
 
 pub trait CapturePort: Send + Sync {
+    /// Resolves an application name/identifier without requiring the
+    /// accessibility grant. Policy uses this before an app-scoped capture so
+    /// aliases cannot bypass `--allow-app` or `--deny-app`.
+    fn resolve_app(&self, _needle: &str) -> Result<Option<AppKey>> {
+        Ok(None)
+    }
+
+    /// Resolves the owner of an opaque window id for app-scoped policy.
+    fn resolve_window_app(&self, _id: WindowId) -> Result<Option<AppKey>> {
+        Ok(None)
+    }
+
     fn capture(&self, target: &CaptureTarget) -> Result<Image>;
 }
 

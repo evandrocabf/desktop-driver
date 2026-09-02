@@ -9,10 +9,11 @@ use std::sync::Mutex;
 use desktop_core::{
     errors::{DesktopError, Result},
     models::{
+        app::AppKey,
         backend::Backend,
         chord::{Chord, Key, NamedKey},
         geometry::{Bounds, CoordinateSpace, Point, ScaleFactor, ScrollDelta},
-        ids::WindowId,
+        ids::{ProcessId, WindowId},
         image::Image,
     },
     ports::{CapturePort, CaptureTarget, InputPort, KEYSTROKE_INTERVAL, MouseButton},
@@ -643,9 +644,92 @@ impl X11Capture {
                 ),
             })
     }
+
+    fn drawable_for_app(&self, needle: &str) -> Result<(WindowId, u32)> {
+        let windows = self.ewmh.toplevels()?;
+        windows
+            .iter()
+            .enumerate()
+            .find(|(_, window)| {
+                window
+                    .pid
+                    .is_some_and(|pid| pid.to_string() == needle.trim())
+                    || window
+                        .class
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(needle.trim()))
+                    || window
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title.eq_ignore_ascii_case(needle.trim()))
+            })
+            .map(|(index, window)| {
+                (
+                    WindowId::new(u32::try_from(index).unwrap_or(u32::MAX)),
+                    window.xid,
+                )
+            })
+            .ok_or_else(|| DesktopError::TargetNotFound {
+                target: format!("application {needle:?}"),
+            })
+    }
 }
 
 impl CapturePort for X11Capture {
+    fn resolve_app(&self, needle: &str) -> Result<Option<AppKey>> {
+        Ok(self.ewmh.toplevels()?.into_iter().find_map(|window| {
+            let matches = window
+                .pid
+                .is_some_and(|pid| pid.to_string() == needle.trim())
+                || window
+                    .class
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(needle.trim()))
+                || window
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.eq_ignore_ascii_case(needle.trim()));
+            matches.then(|| {
+                AppKey::new(
+                    ProcessId::new(
+                        window
+                            .pid
+                            .and_then(|pid| i32::try_from(pid).ok())
+                            .unwrap_or_default(),
+                    ),
+                    window
+                        .class
+                        .as_deref()
+                        .or(window.title.as_deref())
+                        .unwrap_or(needle),
+                )
+            })
+        }))
+    }
+
+    fn resolve_window_app(&self, id: WindowId) -> Result<Option<AppKey>> {
+        Ok(self
+            .ewmh
+            .toplevels()?
+            .into_iter()
+            .nth(id.get() as usize)
+            .map(|window| {
+                AppKey::new(
+                    ProcessId::new(
+                        window
+                            .pid
+                            .and_then(|pid| i32::try_from(pid).ok())
+                            .unwrap_or_default(),
+                    ),
+                    window
+                        .class
+                        .as_deref()
+                        .or(window.title.as_deref())
+                        .unwrap_or("(unknown)"),
+                )
+            }))
+    }
+
     /// Captures the screen, or one window.
     ///
     /// X11 can read any drawable, so a window is captured directly rather than
@@ -677,6 +761,20 @@ impl CapturePort for X11Capture {
                     geometry.width,
                     geometry.height,
                     CoordinateSpace::Window(*id),
+                )
+            }
+            CaptureTarget::App(needle) => {
+                let (id, window) = self.drawable_for_app(needle)?;
+                let geometry = connection
+                    .get_geometry(window)
+                    .map_err(|error| DesktopError::backend(format!("bad window: {error}")))?
+                    .reply()
+                    .map_err(|error| DesktopError::backend(format!("bad window: {error}")))?;
+                (
+                    window,
+                    geometry.width,
+                    geometry.height,
+                    CoordinateSpace::Window(id),
                 )
             }
         };

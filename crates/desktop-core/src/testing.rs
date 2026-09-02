@@ -362,10 +362,19 @@ struct FakeCapture {
 }
 
 impl CapturePort for FakeCapture {
+    fn resolve_app(&self, needle: &str) -> Result<Option<AppKey>> {
+        Ok(Some(AppKey::new(ProcessId::new(1), needle)))
+    }
+
+    fn resolve_window_app(&self, _id: WindowId) -> Result<Option<AppKey>> {
+        Ok(Some(self.state.primary_app()))
+    }
+
     fn capture(&self, target: &CaptureTarget) -> Result<Image> {
         let space = match target {
             CaptureTarget::Screen => CoordinateSpace::primary_screen(),
             CaptureTarget::Window(id) => CoordinateSpace::Window(*id),
+            CaptureTarget::App(_) => CoordinateSpace::Window(WindowId::new(0)),
         };
         let _ = &self.state;
         Image::new(2, 2, ScaleFactor::ONE, space, vec![0; 16])

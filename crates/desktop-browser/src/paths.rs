@@ -117,7 +117,7 @@ fn save_engine_file(path: &Path, engine: BrowserEngine) -> BrowserResult<()> {
     let parent = path
         .parent()
         .ok_or_else(|| BrowserError::new("browser_io", "invalid engine marker path"))?;
-    std::fs::create_dir_all(parent).map_err(io_error)?;
+    ensure_private_dir(parent)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -141,6 +141,45 @@ fn save_engine_file(path: &Path, engine: BrowserEngine) -> BrowserResult<()> {
     #[cfg(not(unix))]
     std::fs::write(&path, engine.as_str()).map_err(io_error)?;
     Ok(())
+}
+
+/// Creates an application-owned directory chain with private permissions.
+///
+/// The XDG/HOME root belongs to the caller and is never chmodded. Starting at
+/// the `desktop-driver` component, every directory belongs to this tool and is
+/// held at 0700, including intermediate session and browser directories.
+#[doc(hidden)]
+pub fn ensure_private_dir(path: &Path) -> BrowserResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path).map_err(io_error)?;
+
+        let mut owned = Vec::new();
+        let mut found_root = false;
+        for ancestor in path.ancestors() {
+            owned.push(ancestor);
+            if ancestor
+                .file_name()
+                .is_some_and(|name| name == "desktop-driver")
+            {
+                found_root = true;
+                break;
+            }
+        }
+        if !found_root {
+            owned.truncate(1);
+        }
+        for directory in owned.into_iter().rev() {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(io_error)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path).map_err(io_error)
 }
 
 pub fn browser_executable(engine: BrowserEngine, explicit: Option<&str>) -> BrowserResult<PathBuf> {
@@ -287,6 +326,34 @@ mod tests {
             profile_engine_from_paths("test", &paths).unwrap(),
             Some(BrowserEngine::Chromium)
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_application_owned_profile_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!(
+            "desktop-browser-permissions-test-{}",
+            std::process::id()
+        ));
+        let owned = root.join("desktop-driver/sessions/test/home/.config/desktop-driver/chromium");
+        let _ = std::fs::remove_dir_all(&root);
+        ensure_private_dir(&owned).unwrap();
+        let app_root = root.join("desktop-driver");
+        let mut current = owned.as_path();
+        loop {
+            assert_eq!(
+                std::fs::metadata(current).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} was not private",
+                current.display()
+            );
+            if current == app_root {
+                break;
+            }
+            current = current.parent().unwrap();
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

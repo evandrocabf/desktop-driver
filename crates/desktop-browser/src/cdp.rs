@@ -10,7 +10,7 @@ use std::{
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 
-use crate::{BrowserError, BrowserResult, Selector};
+use crate::{BrowserError, BrowserResult, Selector, paths::ensure_private_dir};
 
 pub struct Browser {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
@@ -31,13 +31,7 @@ impl Browser {
         user_data: &std::path::Path,
         headless: bool,
     ) -> BrowserResult<Self> {
-        std::fs::create_dir_all(user_data).map_err(io_error)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(user_data, std::fs::Permissions::from_mode(0o700))
-                .map_err(io_error)?;
-        }
+        ensure_private_dir(user_data)?;
         let mut command = Command::new(executable);
         command
             .args([

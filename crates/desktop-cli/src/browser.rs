@@ -629,7 +629,7 @@ fn install(sink: &mut Sink<'_>) -> Result<(), BrowserError> {
         })
         .ok_or_else(|| BrowserError::new("install_failed", "invalid install path"))?
         .to_path_buf();
-    std::fs::create_dir_all(&root).map_err(io_error)?;
+    desktop_browser::ensure_private_dir(&root)?;
     let tmp = std::env::temp_dir().join(format!("desktop-driver-{archive}-{}", std::process::id()));
     let url = format!(
         "https://storage.googleapis.com/chrome-for-testing-public/{VERSION}/{platform}/chrome-{platform}.zip"
@@ -667,7 +667,7 @@ fn install(sink: &mut Sink<'_>) -> Result<(), BrowserError> {
         "desktop-driver-browser-unpack-{}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&unpack).map_err(io_error)?;
+    desktop_browser::ensure_private_dir(&unpack)?;
     let status = ProcessCommand::new("unzip")
         .args(["-q", "-o"])
         .arg(&tmp)

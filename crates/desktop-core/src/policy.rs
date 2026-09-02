@@ -157,6 +157,13 @@ impl Policy {
         }
     }
 
+    /// Whether an observation must identify its application before it can be
+    /// checked. Unscoped screenshots cannot safely bypass an allow/deny list.
+    #[must_use]
+    pub fn has_app_scope(&self) -> bool {
+        !self.allow_apps.is_empty() || !self.deny_apps.is_empty()
+    }
+
     /// Gate for an operation that would seize the pointer or keyboard focus.
     ///
     /// Called separately from [`Policy::check`] because whether a click steals

@@ -99,6 +99,12 @@ failure mid-action: Accessibility (reading the tree), Screen Recording (captures
 and posting events (pointer and keyboard). A process trusted for the first but not the third reads
 everything correctly and has every click discarded, which is why they are reported separately.
 
-macOS attributes a grant to the *launching application* — your terminal — not to `desktop`, and it
-identifies a binary by code signature, so an unsigned build gets a new identity on every rebuild and
-silently loses the grant.
+macOS normally attributes a command-line grant to the *launching application* — your terminal — and
+may also use code identity when deciding whether a grant survives a rebuild. Keep one stable local
+installation and rerun `desktop setup` after replacing it if macOS no longer recognizes the grant.
+An application embedding `desktop` can sign the helper through its own signing process; no signing
+material belongs in this repository.
+
+`desktop setup` invokes the three system permission requests but never approves a dialog. Native
+testing is manual through `scripts/macos-e2e.sh`; missing grants fail its preflight before it launches
+or controls the fixture application.

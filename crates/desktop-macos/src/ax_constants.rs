@@ -26,6 +26,7 @@ pub mod attribute {
     pub const CHILDREN: &str = "AXChildren";
     pub const WINDOWS: &str = "AXWindows";
     pub const MAIN_WINDOW: &str = "AXMainWindow";
+    pub const FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const FOCUSED: &str = "AXFocused";
     pub const ENABLED: &str = "AXEnabled";
     pub const SELECTED: &str = "AXSelected";

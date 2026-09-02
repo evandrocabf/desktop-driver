@@ -8,15 +8,15 @@
 #
 # It does two separable things:
 #
-#   1. puts the `desktop` binary on your PATH — a released build for this
-#      platform where there is one, otherwise built from source;
+#   1. puts the `desktop` binary on your PATH — always built from the checked
+#      out repository on macOS; Linux may use an existing release;
 #   2. installs skills/desktop-driver/ wherever coding agents look for skills;
 #      agents without a directory skill loader receive one flattened file.
 #
-# Piped through `curl | bash` it needs curl and tar and nothing else: the source
-# arrives as a tarball when git is absent, and the binary is downloaded rather
-# than compiled when a release carries one for this platform. Both fall back to
-# the older path — clone, then cargo — and say which one they took.
+# Piped through `curl | bash`, the source arrives as a tarball when git is
+# absent. macOS always needs Cargo because it compiles that source locally;
+# Linux may use an existing binary release. Every route says which
+# one it took.
 #
 # Everything it writes is named as it writes it, `--dry-run` shows the plan
 # without touching anything, and `--uninstall` removes exactly what was added.
@@ -557,7 +557,8 @@ check_deps() {
     fi
   elif [ "$NO_BUILD" -eq 1 ]; then
     skip "cargo (not needed with --no-build)"
-  elif [ "$SRC_MODE" = "clone" ] && [ "$FROM_SOURCE" -eq 0 ] &&
+  elif [ "$(uname -s)" != "Darwin" ] && [ "$SRC_MODE" = "clone" ] &&
+       [ "$FROM_SOURCE" -eq 0 ] &&
        release_target >/dev/null && repo_slug >/dev/null; then
     skip "cargo (not needed unless the download falls through to a source build)"
   else
@@ -627,20 +628,18 @@ build_target_dir() {
   fi
 }
 
-# The release asset this machine can run, or failure where there is no such
-# build. Names are cargo target triples, which is what the release workflow
-# produces and what `rustc -vV` would call this machine.
+# The optional Linux release asset this machine can run, or failure where there
+# is no such build. Names are cargo target triples, which is what `rustc -vV`
+# calls this machine. macOS deliberately has no entry and never takes this route.
 release_target() {
   case "$(uname -s):$(uname -m)" in
     Linux:x86_64)              echo "x86_64-unknown-linux-musl" ;;
     Linux:aarch64|Linux:arm64) echo "aarch64-unknown-linux-musl" ;;
-    Darwin:arm64)              echo "aarch64-apple-darwin" ;;
-    Darwin:x86_64)             echo "x86_64-apple-darwin" ;;
     *) return 1 ;;
   esac
 }
 
-# Tries to fetch a released binary, and reports whether it got one.
+# Tries to fetch a released binary outside macOS, and reports whether it got one.
 #
 # Every failure here is soft. No release yet, an architecture nobody publishes
 # for, a repository that is not on GitHub, a machine with no network — all of
@@ -653,6 +652,7 @@ download_binary() {
 
   [ "$FROM_SOURCE" -eq 0 ] || return 1
   [ "$STATIC" -eq 0 ] || return 1
+  [ "$(uname -s)" != "Darwin" ] || return 1
   # Run from a checkout, the checkout is the point. Someone standing in their
   # own working tree typed ./install.sh to install *that*, and handing them a
   # released binary would quietly discard whatever they had just changed.
@@ -760,6 +760,11 @@ build_binary() {
   fi
 
   if ! have cargo; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+      die "desktop-driver is always compiled from the repository on macOS,
+       and cargo is not installed. Install Rust and run this again:
+         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    fi
     die "nothing to install from: no released binary was available for this platform
        and cargo is not installed. Install Rust and run this again:
          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"

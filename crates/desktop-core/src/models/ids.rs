@@ -1,9 +1,9 @@
 //! Opaque identity newtypes.
 //!
-//! These are driver-assigned handles, deliberately not platform values. A
-//! `WindowId` is not an `XID` and not a `CGWindowID`; the platform value lives
-//! in the adapter's own table. Leaking one would make a snapshot taken under
-//! X11 look interchangeable with one taken under Wayland.
+//! These are opaque handles whose interpretation belongs to the active
+//! adapter. Some adapters assign an ordinal and others preserve a native id so
+//! it can be resolved by a later CLI process. Callers must never compare ids
+//! produced by different backends or sessions.
 
 use std::fmt;
 

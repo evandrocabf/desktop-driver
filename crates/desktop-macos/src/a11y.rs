@@ -6,6 +6,8 @@
 //! by re-walking the tree along its recorded path — which is exactly why the
 //! core models identity as a path rather than a handle.
 
+use std::time::{Duration, Instant};
+
 use desktop_core::{
     errors::{DesktopError, Permission, Result},
     models::{
@@ -14,7 +16,7 @@ use desktop_core::{
         element::{ElementAction, RawNode, States},
         geometry::CoordinateSpace,
         ids::WindowId,
-        path::{self, ElementPath},
+        path::{ElementPath, StaleReason, hash_name},
         role,
         selector::Target,
         snapshot::WalkBudget,
@@ -31,12 +33,14 @@ use crate::{
 pub struct Accessibility;
 
 impl Accessibility {
-    /// Fails early with an actionable message when the grant is missing, since
-    /// every call below would otherwise return empty trees that look like
-    /// applications with no UI.
-    pub fn new() -> Result<Self> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    fn ensure_trusted() -> Result<()> {
         if ax::is_trusted() {
-            return Ok(Self);
+            return Ok(());
         }
         Err(DesktopError::PermissionRequired {
             permission: Permission::Accessibility,
@@ -64,7 +68,7 @@ impl Accessibility {
                 .ok_or_else(|| DesktopError::TargetNotFound {
                     target: target.describe(),
                 }),
-            Target::Focused | Target::Window(_) => {
+            Target::Focused => {
                 let frontmost = process::frontmost_pid();
                 apps.into_iter()
                     .find(|(key, _)| Some(key.pid) == frontmost)
@@ -72,44 +76,150 @@ impl Accessibility {
                         target: target.describe(),
                     })
             }
+            Target::Window(id) => {
+                let pid = process::windows()
+                    .into_iter()
+                    .find(|window| window.id == *id)
+                    .map(|window| window.pid)
+                    .ok_or_else(|| DesktopError::TargetNotFound {
+                        target: target.describe(),
+                    })?;
+                apps.into_iter()
+                    .find(|(key, _)| key.pid == pid)
+                    .ok_or_else(|| DesktopError::TargetNotFound {
+                        target: target.describe(),
+                    })
+            }
         }
+    }
+
+    fn find_saved_app(key: &AppKey) -> Result<Element> {
+        Self::applications()
+            .into_iter()
+            .find(|(candidate, _)| saved_app_matches(candidate, key))
+            .map(|(_, element)| element)
+            .ok_or_else(|| DesktopError::TargetNotFound {
+                target: format!("application {} ({})", key.name, key.pid),
+            })
+    }
+
+    fn windows_for(app_key: &AppKey, app: &Element) -> Result<Vec<(WindowId, usize, Element)>> {
+        let records: Vec<_> = process::windows()
+            .into_iter()
+            .filter(|record| record.pid == app_key.pid)
+            .collect();
+        let mut used = Vec::<WindowId>::new();
+        app.windows()
+            .into_iter()
+            .enumerate()
+            .map(|(index, window)| {
+                let title = window
+                    .string(attribute::TITLE)
+                    .filter(|text| !text.is_empty());
+                let bounds = window.bounds();
+                let record = records
+                    .iter()
+                    .find(|record| {
+                        !used.contains(&record.id)
+                            && record.title == title
+                            && record.bounds == bounds
+                    })
+                    .or_else(|| {
+                        records.iter().find(|record| {
+                            !used.contains(&record.id) && title.is_some() && record.title == title
+                        })
+                    })
+                    .or_else(|| records.get(index).filter(|r| !used.contains(&r.id)))
+                    .or_else(|| records.iter().find(|r| !used.contains(&r.id)));
+                let id = record.map(|record| record.id).ok_or_else(|| {
+                    DesktopError::backend(format!(
+                        "cannot correlate AX window {index} of {} with Core Graphics",
+                        app_key.name
+                    ))
+                })?;
+                used.push(id);
+                Ok((id, index, window))
+            })
+            .collect()
     }
 
     /// Picks the window a target designates.
     ///
-    /// For an unqualified target this is the main window, falling back to the
-    /// first — a single-window application reports one either way.
-    fn find_window(app: &Element, target: &Target) -> Result<(usize, Element)> {
-        let windows = app.windows();
+    /// A focused target uses AXFocusedWindow, an application target uses its
+    /// main window, and both fall back to the first top-level window.
+    fn find_window(
+        app_key: &AppKey,
+        app: &Element,
+        target: &Target,
+    ) -> Result<(WindowId, usize, Element)> {
+        let windows = Self::windows_for(app_key, app)?;
         if windows.is_empty() {
             return Err(DesktopError::TargetNotFound {
                 target: target.describe(),
             });
         }
         match target {
-            Target::Window(id) => {
-                let index = id.get() as usize;
-                windows
-                    .into_iter()
-                    .nth(index)
-                    .map(|window| (index, window))
-                    .ok_or_else(|| DesktopError::TargetNotFound {
-                        target: target.describe(),
-                    })
-            }
+            Target::Window(id) => windows
+                .into_iter()
+                .find(|(candidate, _, _)| candidate == id)
+                .ok_or_else(|| DesktopError::TargetNotFound {
+                    target: target.describe(),
+                }),
             Target::Focused | Target::App(_) => {
-                if let Some(main) = app.element(attribute::MAIN_WINDOW) {
-                    return Ok((0, main));
+                let preferred = if matches!(target, Target::Focused) {
+                    app.element(attribute::FOCUSED_WINDOW)
+                        .or_else(|| app.element(attribute::MAIN_WINDOW))
+                } else {
+                    app.element(attribute::MAIN_WINDOW)
+                };
+                if let Some(preferred) = preferred {
+                    let title = preferred.string(attribute::TITLE);
+                    let bounds = preferred.bounds();
+                    if let Some((id, index, _)) = windows.iter().find(|(_, _, window)| {
+                        window.string(attribute::TITLE) == title && window.bounds() == bounds
+                    }) {
+                        return Ok((*id, *index, preferred));
+                    }
                 }
                 windows
                     .into_iter()
                     .next()
-                    .map(|window| (0, window))
                     .ok_or_else(|| DesktopError::TargetNotFound {
                         target: target.describe(),
                     })
             }
         }
+    }
+
+    fn find_saved_window(
+        app_key: &AppKey,
+        app: &Element,
+        key: &desktop_core::models::app::WindowKey,
+    ) -> Result<Element> {
+        let mut windows = Self::windows_for(app_key, app)?;
+        let title_matches = windows
+            .iter()
+            .filter(|(_, _, window)| window.string(attribute::TITLE) == key.title)
+            .count();
+        if title_matches == 1 {
+            let position = windows
+                .iter()
+                .position(|(_, _, window)| window.string(attribute::TITLE) == key.title)
+                .expect("one title match was counted");
+            return Ok(windows.swap_remove(position).2);
+        }
+        windows
+            .into_iter()
+            .find(|(_, index, window)| {
+                *index == usize::from(key.index)
+                    && (title_matches == 0
+                        || key.title.is_none()
+                        || window.string(attribute::TITLE) == key.title)
+            })
+            .map(|(_, _, window)| window)
+            .ok_or_else(|| DesktopError::TargetNotFound {
+                target: format!("window {:?} of {}", key.title, app_key.name),
+            })
     }
 
     /// Depth-first walk building the normalized tree.
@@ -185,47 +295,97 @@ impl Accessibility {
         node
     }
 
-    fn resolve_node(target: &ElementPath) -> Result<RawNode> {
-        let (_, app) = Self::find_app(&Target::App(target.app.name.clone()))?;
-        let (_, window) = Self::find_window(&app, &Target::Focused)?;
-        let mut visited = 0;
-        let root = Self::walk(&window, WalkBudget::default(), 0, &mut visited);
-        path::resolve(&root, &target.steps)
-            .cloned()
-            .map_err(|reason| DesktopError::ElementStale {
-                element: desktop_core::models::ids::ElementId::new(0),
-                reason,
-            })
+    fn identity(element: &Element) -> (desktop_core::models::role::Role, Option<u64>) {
+        let role_name = element.string(attribute::ROLE).unwrap_or_default();
+        let subrole = element.string(attribute::SUBROLE);
+        let role = role::from_ax(&role_name, subrole.as_deref());
+        let name = element
+            .string(attribute::TITLE)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                element
+                    .string(attribute::DESCRIPTION)
+                    .filter(|text| !text.is_empty())
+            });
+        (role, name.as_deref().map(hash_name))
     }
 
-    /// Re-walks to the live element, rather than the copied tree, so an action
-    /// is performed on the real thing.
+    /// Resolves and returns the exact live AX handle that was validated.
+    ///
+    /// This mirrors `desktop_core::path::resolve`, but keeps the live object so
+    /// a sibling reorder cannot validate one element and act on another.
     fn resolve_element(target: &ElementPath) -> Result<Element> {
-        let (_, app) = Self::find_app(&Target::App(target.app.name.clone()))?;
-        let (_, window) = Self::find_window(&app, &Target::Focused)?;
+        let app = Self::find_saved_app(&target.app)?;
+        let mut current = Self::find_saved_window(&target.app, &app, &target.window)?;
 
-        let mut current = window;
-        for step in &target.steps {
-            let children = current.children();
-            let index = usize::from(step.index);
-            let chosen =
-                children
-                    .into_iter()
-                    .nth(index)
-                    .ok_or_else(|| DesktopError::ElementStale {
-                        element: desktop_core::models::ids::ElementId::new(0),
-                        reason: desktop_core::models::path::StaleReason::PathTruncated {
-                            depth: index,
-                        },
-                    })?;
-            current = chosen;
+        for (depth, step) in target.steps.iter().enumerate() {
+            let mut children = current.children();
+            if children.is_empty() {
+                return Err(stale(StaleReason::PathTruncated { depth }));
+            }
+            let matching_indices: Vec<usize> = children
+                .iter()
+                .enumerate()
+                .filter(|(_, child)| {
+                    let (role, name_hash) = Self::identity(child);
+                    role == step.role && name_hash == step.name_hash
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let index = match matching_indices.as_slice() {
+                [only] => *only,
+                [] => {
+                    let index = usize::from(step.index);
+                    let Some(child) = children.get(index) else {
+                        return Err(stale(StaleReason::PathTruncated { depth }));
+                    };
+                    let (found, _) = Self::identity(child);
+                    if found != step.role {
+                        return Err(stale(StaleReason::RoleChanged {
+                            depth,
+                            expected: step.role.clone(),
+                            found,
+                        }));
+                    }
+                    index
+                }
+                many => {
+                    let index = usize::from(step.index);
+                    if many.contains(&index) {
+                        index
+                    } else {
+                        return Err(stale(StaleReason::Ambiguous {
+                            depth,
+                            matches: many.len(),
+                        }));
+                    }
+                }
+            };
+            current = children.swap_remove(index);
         }
         Ok(current)
     }
 }
 
+fn saved_app_matches(candidate: &AppKey, recorded: &AppKey) -> bool {
+    candidate.pid == recorded.pid
+        && candidate.name == recorded.name
+        && recorded
+            .identifier
+            .as_ref()
+            .is_none_or(|identifier| candidate.identifier.as_ref() == Some(identifier))
+}
+
+fn stale(reason: StaleReason) -> DesktopError {
+    DesktopError::ElementStale {
+        element: desktop_core::models::ids::ElementId::new(0),
+        reason,
+    }
+}
+
 impl AccessibilityPort for Accessibility {
     fn list_apps(&self) -> Result<Vec<Application>> {
+        Self::ensure_trusted()?;
         let frontmost = process::frontmost_pid();
         Ok(process::running_applications()
             .into_iter()
@@ -251,17 +411,17 @@ impl AccessibilityPort for Accessibility {
     /// field exists for Linux, where the window manager sees windows AT-SPI
     /// does not.
     fn list_windows(&self, app: Option<&AppKey>) -> Result<Vec<Window>> {
+        Self::ensure_trusted()?;
         let mut out = Vec::new();
-        let mut next_id = 0u32;
         for (key, element) in Self::applications() {
             if let Some(filter) = app
-                && !key.matches(&filter.name)
+                && key.pid != filter.pid
             {
                 continue;
             }
-            for (index, window) in element.windows().into_iter().enumerate() {
+            for (id, index, window) in Self::windows_for(&key, &element)? {
                 out.push(Window {
-                    id: WindowId::new(next_id),
+                    id,
                     title: window.string(attribute::TITLE),
                     app: key.clone(),
                     bounds: window.bounds(),
@@ -270,7 +430,6 @@ impl AccessibilityPort for Accessibility {
                     accessible: true,
                     index: u16::try_from(index).unwrap_or(u16::MAX),
                 });
-                next_id += 1;
             }
         }
         Ok(out)
@@ -280,20 +439,21 @@ impl AccessibilityPort for Accessibility {
     ///
     /// Reported in screen space, which genuinely exists on macOS.
     fn tree(&self, target: &Target, budget: WalkBudget) -> Result<ResolvedTree> {
+        Self::ensure_trusted()?;
         let (key, app) = Self::find_app(target)?;
-        let (index, window) = Self::find_window(&app, target)?;
+        let (id, index, window) = Self::find_window(&key, &app, target)?;
         let mut visited = 0;
         let root = Self::walk(&window, budget, 0, &mut visited);
 
         Ok(ResolvedTree {
             app: key.clone(),
             window: Window {
-                id: WindowId::new(u32::try_from(index).unwrap_or(0)),
+                id,
                 title: window.string(attribute::TITLE),
                 app: key,
                 bounds: window.bounds(),
-                focused: true,
-                minimized: false,
+                focused: window.boolean(attribute::FOCUSED).unwrap_or(false),
+                minimized: window.boolean(attribute::MINIMIZED).unwrap_or(false),
                 accessible: true,
                 index: u16::try_from(index).unwrap_or(0),
             },
@@ -303,10 +463,14 @@ impl AccessibilityPort for Accessibility {
     }
 
     fn resolve(&self, target: &ElementPath) -> Result<RawNode> {
-        Self::resolve_node(target)
+        Self::ensure_trusted()?;
+        let element = Self::resolve_element(target)?;
+        let mut visited = 0;
+        Ok(Self::walk(&element, WalkBudget::default(), 0, &mut visited))
     }
 
     fn perform(&self, target: &ElementPath, requested: ElementAction) -> Result<()> {
+        Self::ensure_trusted()?;
         let element = Self::resolve_element(target)?;
         let name = element
             .action_names()
@@ -327,8 +491,15 @@ impl AccessibilityPort for Accessibility {
     /// change or a pointer move, so it does not fight whoever else is using the
     /// machine.
     fn set_text(&self, target: &ElementPath, text: &str) -> Result<()> {
+        Self::ensure_trusted()?;
         let element = Self::resolve_element(target)?;
-        element.set_string(attribute::VALUE, text)
+        element.set_string(attribute::VALUE, text)?;
+        if element.string(attribute::VALUE).as_deref() != Some(text) {
+            return Err(DesktopError::backend(
+                "the application accepted AXValue but read-back did not match",
+            ));
+        }
+        Ok(())
     }
 
     /// Raises a window and brings its application forward.
@@ -336,10 +507,23 @@ impl AccessibilityPort for Accessibility {
     /// Raising alone is not enough: the application also has to be activated,
     /// or the raised window sits behind the frontmost one.
     fn focus(&self, target: &Target) -> Result<()> {
+        Self::ensure_trusted()?;
         let (key, app) = Self::find_app(target)?;
-        let (_, window) = Self::find_window(&app, target)?;
-        let _ = window.perform(action::RAISE);
-        process::activate(key.pid)
+        let (_, _, window) = Self::find_window(&key, &app, target)?;
+        window.perform(action::RAISE)?;
+        process::activate(key.pid)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if process::frontmost_pid() == Some(key.pid)
+                && window.boolean(attribute::FOCUSED).unwrap_or(true)
+            {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(DesktopError::backend(
+            "the application did not become frontmost after AXRaise",
+        ))
     }
 }
 
@@ -358,5 +542,13 @@ mod tests {
     #[test]
     fn screen_coordinates_are_real_on_macos_unlike_wayland() {
         assert!(!CoordinateSpace::primary_screen().is_window_relative());
+    }
+
+    #[test]
+    fn a_recorded_bundle_identity_cannot_disappear_during_resolution() {
+        let recorded = AppKey::new(desktop_core::models::ids::ProcessId::new(7), "Fixture")
+            .with_identifier("dev.desktop-driver.fixture");
+        let candidate = AppKey::new(desktop_core::models::ids::ProcessId::new(7), "Fixture");
+        assert!(!saved_app_matches(&candidate, &recorded));
     }
 }

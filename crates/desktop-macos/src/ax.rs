@@ -283,6 +283,19 @@ impl Element {
     /// Sets a string attribute, such as `AXValue` on a text field.
     pub fn set_string(&self, name: &str, value: &str) -> Result<()> {
         let key = CFString::from_str(name);
+        let mut settable = 0;
+        // SAFETY: `settable` is a valid out pointer and `key` is live.
+        let query = unsafe {
+            self.inner.is_attribute_settable(
+                &key,
+                NonNull::new(&mut settable).expect("address of a local is never null"),
+            )
+        };
+        if query != AXError::Success || settable == 0 {
+            return Err(DesktopError::invalid_argument(format!(
+                "this element does not accept text through {name}"
+            )));
+        }
         let text = CFString::from_str(value);
         // SAFETY: both the key and the value are live for the call.
         let error = unsafe { self.inner.set_attribute_value(&key, text.as_ref()) };

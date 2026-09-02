@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --package xtask --"
+
+[env]
+# SCScreenshotManager is available from Sonoma. Keep local/source builds from
+# inheriting rustc's legacy 10.12 default and advertising an impossible floor.
+MACOSX_DEPLOYMENT_TARGET = { value = "14.0", force = true }
