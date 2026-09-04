@@ -93,7 +93,7 @@ jobs:
           "$D" --json browser fill 'css=input' 'macOS browser ✓' --profile "$PROFILE"
           "$D" --json browser click 'css=button' --profile "$PROFILE"
           "$D" --json browser wait --text 'macOS browser ✓' --timeout 10000 --profile "$PROFILE"
-          test "$("$D" --json browser get text 'css=output' --profile "$PROFILE" | jq -r .value)" = 'macOS browser ✓'
+          test "$("$D" --json browser get text 'css=output' --profile "$PROFILE" | jq -r .result.text)" = 'macOS browser ✓'
 
   # The agent-session path end to end, in a container with no desktop at all.
   session:

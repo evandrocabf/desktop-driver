@@ -11,6 +11,8 @@ All notable changes to this project are documented here. The format follows
 - Interactive macOS installs now request Accessibility, Screen Recording and Post Events through
   the installed CLI, wait for the user to approve macOS's native dialogs, and verify the grants.
   Non-interactive installs skip the prompts, and `--no-setup` provides an explicit opt-out.
+- Browser daemon sockets fall back to a short, private runtime path when macOS's long per-user
+  temporary directory would exceed the platform's Unix socket path limit.
 - macOS window ids now preserve the Core Graphics id used by ScreenCaptureKit, `screenshot --app`
   resolves the named application, saved elements re-resolve the recorded app/window and act on the
   same role/name-validated AX handle, and capture no longer depends on Accessibility permission.

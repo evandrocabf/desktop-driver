@@ -1,5 +1,6 @@
 use std::{
     io::Write as _,
+    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
 };
 
@@ -13,6 +14,10 @@ pub struct ProfilePaths {
     pub downloads: PathBuf,
     pub engine_file: PathBuf,
 }
+
+// macOS gives sockaddr_un::sun_path 104 bytes including the trailing NUL.
+// Staying below that limit also works on Linux, whose field is slightly larger.
+const UNIX_SOCKET_PATH_LIMIT: usize = 104;
 
 pub fn profile_name(explicit: Option<&str>, active: Option<&str>) -> BrowserResult<String> {
     let name = explicit.or(active).unwrap_or("default");
@@ -67,14 +72,41 @@ pub fn profile_paths(profile: &str) -> BrowserResult<ProfilePaths> {
     };
     let base = browser_root.join("chromium");
     Ok(ProfilePaths {
-        socket: runtime
-            .join("desktop-driver/browser")
-            .join(format!("{profile}.sock")),
+        socket: socket_path(&runtime, profile),
         downloads: base.join("Downloads"),
         user_data: base,
         firefox_user_data: browser_root.join("firefox"),
         engine_file: browser_root.join("engine"),
     })
+}
+
+fn socket_path(runtime: &Path, profile: &str) -> PathBuf {
+    let filename = format!("{profile}.sock");
+    let preferred = runtime.join("desktop-driver/browser").join(&filename);
+    if preferred.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_LIMIT {
+        return preferred;
+    }
+
+    // Darwin TMPDIR paths commonly consume more than half of sun_path before
+    // desktop-driver adds anything. Hash only the user-specific runtime root:
+    // the profile remains recognisable, while separate users/runtimes cannot
+    // accidentally share a daemon. ensure_private_dir holds this directory at
+    // 0700 before the listener is bound.
+    let runtime_hash = stable_path_hash(runtime);
+    PathBuf::from("/tmp")
+        .join(format!("dd-{runtime_hash:016x}"))
+        .join(filename)
+}
+
+fn stable_path_hash(path: &Path) -> u64 {
+    // FNV-1a is sufficient here: this is a stable namespace, not a security
+    // boundary. Ownership and mode on the containing directory provide that.
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 pub fn profile_engine(profile: &str) -> BrowserResult<Option<BrowserEngine>> {
@@ -173,6 +205,16 @@ pub fn ensure_private_dir(path: &Path) -> BrowserResult<()> {
             owned.truncate(1);
         }
         for directory in owned.into_iter().rev() {
+            let metadata = std::fs::symlink_metadata(directory).map_err(io_error)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(BrowserError::new(
+                    "browser_io",
+                    format!(
+                        "private directory path is not a real directory: {}",
+                        directory.display()
+                    ),
+                ));
+            }
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
                 .map_err(io_error)?;
         }
@@ -278,6 +320,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn short_runtime_paths_keep_the_readable_socket_location() {
+        assert_eq!(
+            socket_path(Path::new("/run/user/1000"), "default"),
+            Path::new("/run/user/1000/desktop-driver/browser/default.sock")
+        );
+    }
+
+    #[test]
+    fn long_darwin_runtime_paths_use_a_stable_sun_len_safe_socket() {
+        let runtime =
+            Path::new("/var/folders/jc/99tq7dzn1n3484kyjlm_vvyc0000gn/T/desktop-driver-runner");
+        let profile = "a".repeat(64);
+        let first = socket_path(runtime, &profile);
+        let second = socket_path(runtime, &profile);
+
+        assert_eq!(first, second);
+        assert!(first.to_string_lossy().starts_with("/tmp/dd-"));
+        assert!(first.ends_with(format!("{profile}.sock")));
+        assert!(first.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_LIMIT);
+        let other_runtime = Path::new(
+            "/var/folders/ab/another_very_long_per_user_runtime_directory/T/desktop-driver-runner",
+        );
+        let other = socket_path(other_runtime, &profile);
+        assert!(other.to_string_lossy().starts_with("/tmp/dd-"));
+        assert_ne!(first, other);
+    }
+
+    #[test]
     fn profile_names_are_safe_for_paths_and_sockets() {
         assert_eq!(profile_name(Some("github_2"), None).unwrap(), "github_2");
         for invalid in ["", "../x", "has space", "a/b"] {
@@ -354,6 +424,28 @@ mod tests {
             }
             current = current.parent().unwrap();
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn application_owned_symlink_directories_are_refused() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "desktop-browser-symlink-test-{}",
+            std::process::id()
+        ));
+        let outside = root.join("outside");
+        let owned = root.join("desktop-driver");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, &owned).unwrap();
+
+        let error = ensure_private_dir(&owned.join("browser"))
+            .expect_err("an application-owned symlink must not be followed");
+        assert_eq!(error.code, "browser_io");
+
+        std::fs::remove_file(owned).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }
