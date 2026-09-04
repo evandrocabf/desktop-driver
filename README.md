@@ -437,12 +437,19 @@ them are found. It names everything it writes as it writes it; `--dry-run`
 shows the plan without touching anything and `--uninstall` removes exactly what
 it added.
 
+On an interactive macOS install, the final step runs the installed binary's
+`desktop setup` command. macOS presents its native permission UI; approve the
+requests, then press Return in the installer so it can verify the grants. The
+installer cannot approve privacy permissions itself. Automated installs skip
+this interactive step, and `--no-setup` skips it explicitly.
+
 ```bash
 ./install.sh --dry-run               # see the plan first
 ./install.sh --project .             # install into this project instead of $HOME
 ./install.sh --agents codex,cursor   # pick the agents yourself
 ./install.sh --all                   # every known agent, detected or not
 ./install.sh --no-agents             # just the binary
+./install.sh --no-setup              # skip macOS permission prompts
 ./install.sh --from-source           # compile, even where a release exists (automatic on macOS)
 ./install.sh --static                # a musl binary that runs on any Linux
 ./install.sh --update                # refresh checkout, binary and installed skills
@@ -593,9 +600,10 @@ Three separate permissions, with separate prompts:
   capabilities` preflights it separately and reports `mouse`, `keyboard` and
   `scroll` as unavailable rather than letting them fail silently.
 
-`desktop setup` requests all three grants. macOS owns the dialogs; approve them
-in the visible system UI, then rerun `desktop capabilities` to verify the
-result. The tool never reads or types authentication material.
+Interactive macOS installs run `desktop setup` automatically after installing
+the binary, wait for you to approve the native dialogs, and then verify the
+result. You can also run `desktop setup` later. macOS owns the dialogs; the tool
+cannot approve them and never reads or types authentication material.
 
 The one that confuses everyone: a command-line tool inherits the permission of
 **the terminal that launched it**. Grant access to iTerm2 / Ghostty / Terminal,

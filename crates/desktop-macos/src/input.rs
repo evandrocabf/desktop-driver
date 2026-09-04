@@ -247,9 +247,19 @@ fn text_events(text: &str) -> Vec<TextEvent> {
         }
     };
 
-    for character in text.chars() {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
         let named = match character {
-            '\n' | '\r' => Some(NamedKey::Return),
+            '\r' => {
+                // Treat the conventional CRLF pair as one logical newline.
+                // Without consuming LF here, pasted Windows text gains a
+                // blank line after every line on macOS.
+                if characters.peek() == Some(&'\n') {
+                    let _ = characters.next();
+                }
+                Some(NamedKey::Return)
+            }
+            '\n' => Some(NamedKey::Return),
             '\t' => Some(NamedKey::Tab),
             _ => None,
         };
@@ -362,6 +372,18 @@ mod tests {
     fn a_newline_in_the_middle_is_its_own_event() {
         assert_eq!(text_events("a\nb").len(), 3);
         assert_eq!(text_events("a\nb")[1], TextEvent::Named(NamedKey::Return));
+    }
+
+    #[test]
+    fn windows_line_endings_produce_one_return_per_line() {
+        assert_eq!(
+            text_events("a\r\nb"),
+            vec![
+                TextEvent::Unicode(vec![u16::from(b'a')]),
+                TextEvent::Named(NamedKey::Return),
+                TextEvent::Unicode(vec![u16::from(b'b')]),
+            ]
+        );
     }
 
     #[test]

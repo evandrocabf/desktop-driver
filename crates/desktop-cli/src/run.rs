@@ -432,7 +432,7 @@ fn budget_of(args: &BudgetArgs) -> WalkBudget {
     }
 }
 
-/// Walks the user through the one-time grant Wayland needs.
+/// Walks the user through the one-time grants the selected backend needs.
 fn setup(driver: &Driver, sink: &mut Sink<'_>) -> Result<()> {
     let permissions = driver.request_permissions();
     let capabilities = driver.capabilities();

@@ -22,9 +22,7 @@ use block2::RcBlock;
 use dispatch2::{DispatchSemaphore, DispatchTime};
 use objc2::AnyThread as _;
 use objc2_core_foundation::{CFRetained, CGRect};
-use objc2_core_graphics::{
-    CGDisplayCopyDisplayMode, CGDisplayMode, CGImage, CGImageAlphaInfo, CGMainDisplayID,
-};
+use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGDisplayMode, CGImage, CGMainDisplayID};
 use objc2_foundation::NSError;
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
@@ -46,6 +44,9 @@ use desktop_core::{
 /// The first call after a permission change can be slow, but an unbounded wait
 /// would hang the CLI when the user never answers the prompt.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ScreenCaptureKit's documented SDR format: packed little-endian BGRA8.
+const BGRA_PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"BGRA");
 
 pub struct ScreenCaptureKit;
 
@@ -133,7 +134,14 @@ impl ScreenCaptureKit {
         unsafe {
             configuration.setWidth(width.max(1) as usize);
             configuration.setHeight(height.max(1) as usize);
+            configuration.setPixelFormat(BGRA_PIXEL_FORMAT);
+            configuration.setScalesToFit(true);
+            configuration.setPreservesAspectRatio(true);
             configuration.setShowsCursor(false);
+            // A window's SCWindow frame excludes its shadow. Match those
+            // dimensions exactly and retain portions that sit off-screen.
+            configuration.setIgnoreShadowsSingleWindow(true);
+            configuration.setIgnoreGlobalClipSingleWindow(true);
         }
 
         let slot = Arc::new(AtomicPtr::<CGImage>::new(ptr::null_mut()));
@@ -230,7 +238,7 @@ impl CapturePort for ScreenCaptureKit {
                 };
                 // SAFETY: property reads on a live display.
                 let (width, height) = unsafe { (display.width(), display.height()) };
-                let scale = display_scale(unsafe { display.displayID() });
+                let scale = filter_scale(&filter, display_scale(unsafe { display.displayID() }));
                 Self::capture_with(
                     &filter,
                     scaled(width, scale),
@@ -259,7 +267,7 @@ impl CapturePort for ScreenCaptureKit {
                 };
                 // SAFETY: property read on a live window.
                 let frame: CGRect = unsafe { window.frame() };
-                let scale = scale_for_frame(&content, frame);
+                let scale = scale_for_filter_and_frame(&filter, &content, frame);
                 Self::capture_with(
                     &filter,
                     scaled(frame.size.width as isize, scale),
@@ -308,7 +316,7 @@ impl CapturePort for ScreenCaptureKit {
                         &window,
                     )
                 };
-                let scale = scale_for_frame(&content, frame);
+                let scale = scale_for_filter_and_frame(&filter, &content, frame);
                 Self::capture_with(
                     &filter,
                     scaled(frame.size.width as isize, scale),
@@ -335,18 +343,19 @@ fn wait_for(semaphore: &DispatchSemaphore) -> bool {
 /// The row stride is almost never `width * 4` — Core Graphics pads rows for
 /// alignment — so copying the buffer wholesale produces a sheared image.
 ///
-/// ScreenCaptureKit delivers BGRA on Apple silicon and Intel alike, so the red
-/// and blue channels are swapped on the way out.
+/// The configuration explicitly requests BGRA8 on Apple silicon and Intel, so
+/// red and blue are swapped on the way out and the window's alpha is retained.
 fn to_rgba(image: &CGImage, scale: ScaleFactor, space: CoordinateSpace) -> Result<Image> {
-    let (width, height, bytes_per_row, bits_per_pixel) = (
+    let (width, height, bytes_per_row, bits_per_component, bits_per_pixel) = (
         CGImage::width(Some(image)),
         CGImage::height(Some(image)),
         CGImage::bytes_per_row(Some(image)),
+        CGImage::bits_per_component(Some(image)),
         CGImage::bits_per_pixel(Some(image)),
     );
-    if bits_per_pixel != 32 {
+    if bits_per_component != 8 || bits_per_pixel != 32 {
         return Err(DesktopError::backend(format!(
-            "unexpected capture format: {bits_per_pixel} bits per pixel"
+            "unexpected capture format: {bits_per_component} bits per component, {bits_per_pixel} bits per pixel"
         )));
     }
 
@@ -361,40 +370,52 @@ fn to_rgba(image: &CGImage, scale: ScaleFactor, space: CoordinateSpace) -> Resul
         std::slice::from_raw_parts(pointer, length)
     };
 
-    let alpha = CGImage::alpha_info(Some(image));
-    let swap_red_and_blue = matches!(
-        alpha,
-        CGImageAlphaInfo::First
-            | CGImageAlphaInfo::PremultipliedFirst
-            | CGImageAlphaInfo::NoneSkipFirst
-    );
+    let pixels = bgra_rows_to_rgba(bytes, width, height, bytes_per_row)?;
 
-    let mut pixels = Vec::with_capacity(width * height * 4);
+    let width = u32::try_from(width)
+        .map_err(|_| DesktopError::backend("capture width does not fit in the image model"))?;
+    let height = u32::try_from(height)
+        .map_err(|_| DesktopError::backend("capture height does not fit in the image model"))?;
+    Image::new(width, height, scale, space, pixels)
+        .map_err(|error| DesktopError::backend(error.to_string()))
+}
+
+fn bgra_rows_to_rgba(
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+    bytes_per_row: usize,
+) -> Result<Vec<u8>> {
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| DesktopError::backend("capture row dimensions overflow"))?;
+    let capacity = row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| DesktopError::backend("capture dimensions overflow"))?;
+    if bytes_per_row < row_bytes {
+        return Err(DesktopError::backend(
+            "capture row stride is shorter than its pixel width",
+        ));
+    }
+
+    let mut pixels = Vec::with_capacity(capacity);
     for row in 0..height {
-        let start = row * bytes_per_row;
-        let end = start + width * 4;
+        let start = row
+            .checked_mul(bytes_per_row)
+            .ok_or_else(|| DesktopError::backend("capture row offset overflow"))?;
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or_else(|| DesktopError::backend("capture row offset overflow"))?;
         if end > bytes.len() {
             return Err(DesktopError::backend(
                 "capture buffer is shorter than its stated dimensions",
             ));
         }
         for chunk in bytes[start..end].chunks_exact(4) {
-            if swap_red_and_blue {
-                pixels.extend_from_slice(&[chunk[2], chunk[1], chunk[0], 0xff]);
-            } else {
-                pixels.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xff]);
-            }
+            pixels.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
         }
     }
-
-    Image::new(
-        u32::try_from(width).unwrap_or(0),
-        u32::try_from(height).unwrap_or(0),
-        scale,
-        space,
-        pixels,
-    )
-    .map_err(|error| DesktopError::backend(error.to_string()))
+    Ok(pixels)
 }
 
 fn scaled(points: isize, scale: ScaleFactor) -> isize {
@@ -427,6 +448,30 @@ fn scale_for_frame(content: &SCShareableContent, frame: CGRect) -> ScaleFactor {
         .max_by(|(left, _), (right, _)| left.total_cmp(right))
         .map(|(_, display)| display_scale(unsafe { display.displayID() }))
         .unwrap_or(ScaleFactor::ONE)
+}
+
+fn filter_scale(filter: &SCContentFilter, fallback: ScaleFactor) -> ScaleFactor {
+    // Available on the minimum supported macOS (14.0). It reflects the exact
+    // filter ScreenCaptureKit will render and is more authoritative than
+    // reconstructing the scale from the current display mode.
+    let scale = f64::from(unsafe { filter.pointPixelScale() });
+    valid_scale_or(scale, fallback)
+}
+
+fn scale_for_filter_and_frame(
+    filter: &SCContentFilter,
+    content: &SCShareableContent,
+    frame: CGRect,
+) -> ScaleFactor {
+    filter_scale(filter, scale_for_frame(content, frame))
+}
+
+fn valid_scale_or(scale: f64, fallback: ScaleFactor) -> ScaleFactor {
+    if scale.is_finite() && scale > 0.0 {
+        ScaleFactor::new(scale)
+    } else {
+        fallback
+    }
 }
 
 fn intersection_area(left: CGRect, right: CGRect) -> f64 {
@@ -520,5 +565,26 @@ mod tests {
             },
         );
         assert!(intersection_area(window, right) > intersection_area(window, left));
+    }
+
+    #[test]
+    fn bgra_conversion_preserves_transparency_and_skips_row_padding() {
+        let bytes = [10, 20, 30, 40, 50, 60, 70, 80, 0xaa, 0xbb, 0xcc, 0xdd];
+        let rgba = bgra_rows_to_rgba(&bytes, 2, 1, 12).expect("valid BGRA row");
+        assert_eq!(rgba, [30, 20, 10, 40, 70, 60, 50, 80]);
+    }
+
+    #[test]
+    fn malformed_capture_strides_fail_instead_of_shearing_the_image() {
+        assert!(bgra_rows_to_rgba(&[0; 8], 2, 1, 7).is_err());
+        assert!(bgra_rows_to_rgba(&[0; 7], 2, 1, 8).is_err());
+    }
+
+    #[test]
+    fn invalid_filter_scales_use_the_display_fallback() {
+        let fallback = ScaleFactor::new(2.0);
+        assert_eq!(valid_scale_or(0.0, fallback), fallback);
+        assert_eq!(valid_scale_or(f64::NAN, fallback), fallback);
+        assert_eq!(valid_scale_or(1.5, fallback), ScaleFactor::new(1.5));
     }
 }

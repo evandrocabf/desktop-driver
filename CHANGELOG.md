@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Interactive macOS installs now request Accessibility, Screen Recording and Post Events through
+  the installed CLI, wait for the user to approve macOS's native dialogs, and verify the grants.
+  Non-interactive installs skip the prompts, and `--no-setup` provides an explicit opt-out.
 - macOS window ids now preserve the Core Graphics id used by ScreenCaptureKit, `screenshot --app`
   resolves the named application, saved elements re-resolve the recorded app/window and act on the
   same role/name-validated AX handle, and capture no longer depends on Accessibility permission.
@@ -15,6 +18,12 @@ All notable changes to this project are documented here. The format follows
   preserves ScreenCaptureKit error details. Text input no longer splits surrogate pairs or injects a
   zero-width character; it emits matching key-up events, layout-independent character shortcuts,
   and correct multi-click state.
+- macOS accessibility walks apply the timeout to every AX element, bound large child arrays before
+  crossing the process boundary, recover labels from title elements and placeholders, and expose
+  checked/expanded/focusable state. Malformed AX arrays are ignored instead of unsafely cast.
+- macOS capture requests BGRA and the filter's actual backing scale explicitly, retains transparent
+  window pixels, and includes portions of windows positioned off-screen. CRLF text now produces one
+  Return event per logical newline.
 - `desktop setup` requests Accessibility, Screen Recording and Post Events; AXValue and focus calls
   verify their result. Browser profile intermediate directories are tightened to `0700`.
 - macOS builds declare a 14.0 deployment floor. A strict, manually invoked AppKit E2E fixture

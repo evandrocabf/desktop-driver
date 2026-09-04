@@ -242,14 +242,7 @@ impl Accessibility {
         let subrole = element.string(attribute::SUBROLE);
         let role = role::from_ax(&role_name, subrole.as_deref());
 
-        let name = element
-            .string(attribute::TITLE)
-            .filter(|text| !text.is_empty())
-            .or_else(|| {
-                element
-                    .string(attribute::DESCRIPTION)
-                    .filter(|text| !text.is_empty())
-            });
+        let name = accessible_name(element);
 
         let actions: Vec<ElementAction> = element
             .action_names()
@@ -262,21 +255,29 @@ impl Accessibility {
                 acc
             });
 
-        let mut node = RawNode::new(role);
+        let value = element.value_string(attribute::VALUE);
+        let focused = element.boolean(attribute::FOCUSED);
+        let mut node = RawNode::new(role.clone());
         node.name = name;
         node.description = element
             .string(attribute::HELP)
             .filter(|text| !text.is_empty());
-        node.value = element.value_string(attribute::VALUE);
+        node.value = value.clone();
         node.bounds = element.bounds();
         node.actions = actions;
         node.states = States {
             enabled: element.boolean(attribute::ENABLED).unwrap_or(true),
-            focused: element.boolean(attribute::FOCUSED).unwrap_or(false),
-            focusable: false,
+            focused: focused.unwrap_or(false),
+            // AX exposes `AXFocused` only on elements that participate in the
+            // focus system. Reuse the value already read above rather than
+            // adding another IPC round-trip for every node in a large tree.
+            focusable: focused.is_some(),
             selected: element.boolean(attribute::SELECTED).unwrap_or(false),
-            checked: false,
-            expanded: false,
+            checked: checked_from_value(&role, value.as_deref()),
+            expanded: element
+                .boolean(attribute::EXPANDED)
+                .or_else(|| element.boolean(attribute::DISCLOSING))
+                .unwrap_or(false),
             visible: !element.boolean(attribute::HIDDEN).unwrap_or(false),
             showing: !element.boolean(attribute::HIDDEN).unwrap_or(false),
             protected: false,
@@ -284,7 +285,8 @@ impl Accessibility {
         node.native = None;
 
         if depth < budget.max_depth && *visited < budget.max_nodes {
-            for child in element.children() {
+            let remaining = budget.max_nodes.saturating_sub(*visited);
+            for child in element.children_limited(remaining) {
                 if *visited >= budget.max_nodes {
                     break;
                 }
@@ -299,14 +301,7 @@ impl Accessibility {
         let role_name = element.string(attribute::ROLE).unwrap_or_default();
         let subrole = element.string(attribute::SUBROLE);
         let role = role::from_ax(&role_name, subrole.as_deref());
-        let name = element
-            .string(attribute::TITLE)
-            .filter(|text| !text.is_empty())
-            .or_else(|| {
-                element
-                    .string(attribute::DESCRIPTION)
-                    .filter(|text| !text.is_empty())
-            });
+        let name = accessible_name(element);
         (role, name.as_deref().map(hash_name))
     }
 
@@ -365,6 +360,48 @@ impl Accessibility {
         }
         Ok(current)
     }
+}
+
+fn non_empty(text: Option<String>) -> Option<String> {
+    text.filter(|text| !text.trim().is_empty())
+}
+
+/// The best human-facing label macOS exposes for an element.
+///
+/// Native controls often put their label in `AXTitleUIElement` and web/native
+/// text fields commonly expose only a placeholder. Keeping this in one helper
+/// also makes snapshot identity use exactly the name the user saw.
+fn accessible_name(element: &Element) -> Option<String> {
+    non_empty(element.string(attribute::TITLE))
+        .or_else(|| {
+            element
+                .element(attribute::TITLE_UI_ELEMENT)
+                .and_then(|label| {
+                    non_empty(label.string(attribute::TITLE))
+                        .or_else(|| non_empty(label.value_string(attribute::VALUE)))
+                        .or_else(|| non_empty(label.string(attribute::DESCRIPTION)))
+                })
+        })
+        .or_else(|| non_empty(element.string(attribute::DESCRIPTION)))
+        .or_else(|| non_empty(element.string(attribute::PLACEHOLDER_VALUE)))
+}
+
+fn checked_from_value(role: &desktop_core::models::role::Role, value: Option<&str>) -> bool {
+    if !matches!(
+        role,
+        desktop_core::models::role::Role::CheckBox
+            | desktop_core::models::role::Role::RadioButton
+            | desktop_core::models::role::Role::Switch
+            | desktop_core::models::role::Role::ToggleButton
+    ) {
+        return false;
+    }
+    value.is_some_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "unchecked"
+        )
+    })
 }
 
 fn saved_app_matches(candidate: &AppKey, recorded: &AppKey) -> bool {
@@ -550,5 +587,16 @@ mod tests {
             .with_identifier("dev.desktop-driver.fixture");
         let candidate = AppKey::new(desktop_core::models::ids::ProcessId::new(7), "Fixture");
         assert!(!saved_app_matches(&candidate, &recorded));
+    }
+
+    #[test]
+    fn native_toggle_values_are_normalized_into_checked_state() {
+        use desktop_core::models::role::Role;
+
+        assert!(checked_from_value(&Role::CheckBox, Some("1")));
+        assert!(checked_from_value(&Role::Switch, Some("true")));
+        assert!(checked_from_value(&Role::CheckBox, Some("2")));
+        assert!(!checked_from_value(&Role::CheckBox, Some("0")));
+        assert!(!checked_from_value(&Role::Button, Some("1")));
     }
 }

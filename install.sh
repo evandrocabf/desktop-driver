@@ -40,6 +40,7 @@ INSTALL_ALL=0
 NO_AGENTS=0
 NO_BIN=0
 NO_BUILD=0
+NO_SETUP=0
 PROJECT_DIR=""
 PREFIX="${XDG_BIN_HOME:-$HOME/.local/bin}"
 SRC_DIR_ARG=""
@@ -120,6 +121,7 @@ Options
   --no-agents       skip the skill entirely, just install the binary
   --no-bin          skip the binary, just install the skill
   --no-build        do not run cargo; use an already-built target/release/desktop
+  --no-setup        skip the interactive macOS permission requests
   --from-source     always compile, even where a released binary is available
   --static          build a static musl binary (runs on any Linux, any glibc)
   --project DIR     install into DIR/.claude/... instead of your home directory
@@ -142,6 +144,7 @@ while [ $# -gt 0 ]; do
     --no-agents) NO_AGENTS=1; shift ;;
     --no-bin)    NO_BIN=1; shift ;;
     --no-build)  NO_BUILD=1; shift ;;
+    --no-setup)  NO_SETUP=1; shift ;;
     --from-source) FROM_SOURCE=1; shift ;;
     --static)    STATIC=1; shift ;;
     --project)   PROJECT_DIR="${2:-}"; shift 2 ;;
@@ -794,6 +797,8 @@ install_bin() {
     return
   fi
 
+  INSTALLED_BIN="$dest"
+
   if [ "$DRY_RUN" -eq 1 ]; then
     info "${DIM}would: install $BUILT_BIN -> $dest${R}"
     info "${DIM}would: record it in $MANIFEST${R}"
@@ -822,6 +827,69 @@ install_bin() {
     *":$PREFIX:"*) ;;
     *) PATH_HINT="$PREFIX" ;;
   esac
+}
+
+setup_macos_permissions() {
+  local setup_json setup_compact
+
+  if [ "$(uname -s)" != "Darwin" ] || [ "$NO_BIN" -eq 1 ]; then
+    return 0
+  fi
+
+  if [ "$NO_SETUP" -eq 1 ]; then
+    skip "macOS permission requests (--no-setup)"
+    return 0
+  fi
+  if [ -z "$INSTALLED_BIN" ]; then
+    warn "the binary was not installed, so macOS permissions were not requested"
+    return 0
+  fi
+
+  step "Requesting macOS permissions"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "${DIM}would: $INSTALLED_BIN setup${R}"
+    info "${DIM}would: wait for approval, then verify the grants${R}"
+    say ""
+    return 0
+  fi
+
+  # A person running `curl | bash` still has a controlling terminal on
+  # /dev/tty even though stdin is the script pipe. Automated jobs do not, and
+  # must never hang waiting for a privacy dialog nobody can answer.
+  if [ ! -t 1 ] || [ ! -r /dev/tty ]; then
+    warn "non-interactive install — macOS permission prompts were skipped"
+    info "Run:      $INSTALLED_BIN setup"
+    say ""
+    return 0
+  fi
+
+  info "macOS may ask for Accessibility, Screen Recording and Post Events."
+  info "Approve each request in the visible system UI. The installer cannot approve them for you."
+  if ! setup_json="$("$INSTALLED_BIN" --json setup)"; then
+    warn "desktop could not open the macOS permission requests"
+    info "Run later: $INSTALLED_BIN setup"
+    say ""
+    return 0
+  fi
+
+  setup_compact="$(printf '%s' "$setup_json" | tr -d '[:space:]')"
+  case "$setup_compact" in
+    *'"ready":true'*)
+      ok "macOS permissions were already granted"
+      say ""
+      return 0
+      ;;
+  esac
+
+  printf '  Press Return here after approving the macOS permissions... ' >/dev/tty
+  IFS= read -r _ </dev/tty
+  say ""
+  info "Verifying the grants:"
+  if ! "$INSTALLED_BIN" setup; then
+    warn "desktop could not verify the macOS permissions"
+    info "Run later: $INSTALLED_BIN setup"
+  fi
+  say ""
 }
 
 # A copied binary carries no marker of its own, so ownership is recorded beside
@@ -1001,6 +1069,7 @@ NO_AGENT_DETECTED=0
 SRC=""
 SRC_MODE=""
 BUILT_BIN=""
+INSTALLED_BIN=""
 DOWNLOAD_TMP=""
 
 if [ -n "$PROJECT_DIR" ]; then
@@ -1099,6 +1168,8 @@ if [ "$NO_AGENTS" -eq 0 ]; then
   done
   say ""
 fi
+
+setup_macos_permissions
 
 # ── what to do next ──────────────────────────────────────────────────────────
 
