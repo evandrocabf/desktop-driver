@@ -23,6 +23,9 @@ pub use paths::{
     profile_paths, save_profile_engine,
 };
 
+#[doc(hidden)]
+pub use paths::ensure_private_dir;
+
 pub fn daemon_wait(profile: &str) -> BrowserResult<()> {
     daemon::wait_for_socket(&profile_paths(profile)?.socket)
 }

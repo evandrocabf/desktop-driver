@@ -65,7 +65,7 @@ pub enum Command {
     /// Diagnose why the accessibility tree is empty, shallow, or unreachable.
     Doctor,
 
-    /// Perform the one-time interactive grant Wayland input and capture need.
+    /// Request the one-time interactive grants this platform needs.
     Setup,
 
     /// List running applications.

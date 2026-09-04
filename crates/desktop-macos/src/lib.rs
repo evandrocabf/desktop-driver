@@ -4,10 +4,10 @@
 //! `CGWindowListCopyWindowInfo` for applications and windows, ScreenCaptureKit
 //! for capture and `CGEvent` for input.
 //!
-//! Two permissions gate all of it, and they are separate TCC entries with
-//! separate prompts: **Accessibility** (tree, element actions, and posting
-//! synthetic events) and **Screen Recording** (capture, and window *titles* in
-//! the window list). `desktop doctor` explains both.
+//! Three permissions gate it, as separate TCC checks: **Accessibility** (tree
+//! and element actions), **Screen Recording** (capture and window titles), and
+//! **Post Events** (synthetic pointer and keyboard input). `desktop doctor`
+//! explains each one.
 //!
 //! Minimum supported macOS is **14 (Sonoma)** — `SCScreenshotManager` requires
 //! it, and `CGWindowListCreateImage` is obsoleted in the macOS 15 SDK.
@@ -43,7 +43,7 @@ pub use probe::{capabilities, diagnostics, info as backend_info};
 /// Builds the port set for this Mac.
 pub fn build_ports() -> Result<Ports> {
     Ok(Ports {
-        accessibility: Box::new(a11y::Accessibility::new()?),
+        accessibility: Box::new(a11y::Accessibility::new()),
         capture: Box::new(capture::ScreenCaptureKit::new()),
         input: Box::new(input::CoreGraphicsInput::new()),
         probe: Box::new(probe::MacosProbe::new()),
@@ -173,5 +173,16 @@ mod unsupported {
         fn scroll(&self, _delta: ScrollDelta, _space: &CoordinateSpace) -> Result<()> {
             Err(needs_accessibility())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn building_capture_ports_does_not_require_accessibility_permission() {
+        // Individual operations enforce their own TCC grant. Construction
+        // must stay permission-independent so Screen Recording can work on a
+        // machine where Accessibility is intentionally denied.
+        assert!(super::build_ports().is_ok());
     }
 }

@@ -100,7 +100,7 @@ impl CapturePort for UnsupportedCapture {
     fn capture(&self, target: &CaptureTarget) -> Result<Image> {
         Err(self.refuse(match target {
             CaptureTarget::Screen => Capability::Screenshots,
-            CaptureTarget::Window(_) => Capability::WindowScreenshots,
+            CaptureTarget::Window(_) | CaptureTarget::App(_) => Capability::WindowScreenshots,
         }))
     }
 }

@@ -44,29 +44,28 @@ impl Element {
         // retained element; an invalid pid yields an element whose queries all
         // fail, which the callers handle.
         let inner = unsafe { AXUIElement::new_application(pid) };
-        // SAFETY: the element was just created and is uniquely owned here.
-        unsafe {
-            inner.set_messaging_timeout(MESSAGING_TIMEOUT_SECONDS);
-        }
-        Self { inner }
+        Self::from_retained(inner)
     }
 
     fn from_retained(inner: CFRetained<AXUIElement>) -> Self {
+        // The timeout belongs to one AXUIElementRef, not to the target process.
+        // Child and focused-window references therefore need it just as much as
+        // the application root; otherwise a single hung control can still
+        // block the CLI indefinitely.
+        // SAFETY: `inner` is live and the timeout is finite and positive.
+        let _ = unsafe { inner.set_messaging_timeout(MESSAGING_TIMEOUT_SECONDS) };
         Self { inner }
     }
 
     /// Reads an attribute as an untyped Core Foundation value.
     fn attribute(&self, name: &str) -> Option<CFRetained<CFType>> {
         let key = CFString::from_str(name);
-        let raw: *const CFType = std::ptr::null();
+        let mut raw: *const CFType = std::ptr::null();
         // SAFETY: `raw` is a valid, properly aligned pointer to a nullable
         // `*const CFType`, which is exactly what the API writes through.
         let error = unsafe {
-            self.inner.copy_attribute_value(
-                &key,
-                NonNull::new(&raw as *const _ as *mut *const CFType)
-                    .expect("address of a local is never null"),
-            )
+            self.inner
+                .copy_attribute_value(&key, NonNull::from(&mut raw))
         };
         if error != AXError::Success || raw.is_null() {
             return None;
@@ -178,6 +177,19 @@ impl Element {
         self.element_array(crate::ax_constants::attribute::CHILDREN)
     }
 
+    /// Child elements, capped before the target application constructs the
+    /// result array.
+    ///
+    /// Large tables can expose hundreds of thousands of AX children. Reading
+    /// the whole `AXChildren` value and truncating it afterwards defeats the
+    /// walk budget and can stall or exhaust the CLI. Apple's ranged API keeps
+    /// the budget effective at the process boundary. Custom AX providers that
+    /// do not implement the ranged call retain the old full-array fallback.
+    #[must_use]
+    pub fn children_limited(&self, limit: usize) -> Vec<Self> {
+        self.element_array_limited(crate::ax_constants::attribute::CHILDREN, limit)
+    }
+
     /// Top-level windows, for an application element.
     #[must_use]
     pub fn windows(&self) -> Vec<Self> {
@@ -192,20 +204,49 @@ impl Element {
             return Vec::new();
         };
 
+        Self::elements_from_array(array)
+    }
+
+    fn element_array_limited(&self, name: &str, limit: usize) -> Vec<Self> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let key = CFString::from_str(name);
+        let mut raw: *const CFArray = std::ptr::null();
+        let max_values = isize::try_from(limit).unwrap_or(isize::MAX);
+        // SAFETY: `raw` is a valid out pointer, the range starts at zero, and
+        // `max_values` is positive. The returned array, on success, is +1.
+        let error = unsafe {
+            self.inner
+                .copy_attribute_values(&key, 0, max_values, NonNull::from(&mut raw))
+        };
+        if error != AXError::Success || raw.is_null() {
+            return self.element_array(name).into_iter().take(limit).collect();
+        }
+        // SAFETY: success with a non-null pointer transfers one owned
+        // reference to the caller.
+        let Some(pointer) = NonNull::new(raw.cast_mut()) else {
+            return Vec::new();
+        };
+        let array = unsafe { CFRetained::<CFArray>::from_raw(pointer) };
+        Self::elements_from_array(&array)
+    }
+
+    fn elements_from_array(array: &CFArray) -> Vec<Self> {
         let count = array.count();
         let mut out = Vec::with_capacity(count.max(0) as usize);
         for index in 0..count {
-            // SAFETY: `index` is within `0..count`, and the array is a live
-            // CFArray of AX elements.
+            // SAFETY: `index` is within `0..count` and the array is live.
             let raw = unsafe { array.value_at_index(index) };
             let Some(pointer) = NonNull::new(raw.cast_mut()) else {
                 continue;
             };
-            // SAFETY: CFArray gives back a borrowed (+0) reference, so it is
-            // retained before being taken ownership of.
-            let element = unsafe {
-                let typed: NonNull<AXUIElement> = pointer.cast();
-                CFRetained::retain(typed)
+            // SAFETY: CFArray gives back a borrowed (+0) CFType reference, so
+            // it is retained before the checked downcast takes ownership.
+            let value = unsafe { CFRetained::retain(pointer.cast::<CFType>()) };
+            let Ok(element) = value.downcast::<AXUIElement>() else {
+                continue;
             };
             out.push(Self::from_retained(element));
         }
@@ -216,25 +257,16 @@ impl Element {
     #[must_use]
     pub fn element(&self, name: &str) -> Option<Self> {
         let value = self.attribute(name)?;
-        let raw = CFRetained::into_raw(value);
-        // SAFETY: the attribute is known to be an AXUIElement when the caller
-        // asks for one of the element-valued attribute names; the cast keeps
-        // the same +1 reference count.
-        let element = unsafe { CFRetained::from_raw(raw.cast::<AXUIElement>()) };
+        let element = value.downcast::<AXUIElement>().ok()?;
         Some(Self::from_retained(element))
     }
 
     /// The action names this element advertises.
     #[must_use]
     pub fn action_names(&self) -> Vec<String> {
-        let raw: *const CFArray = std::ptr::null();
+        let mut raw: *const CFArray = std::ptr::null();
         // SAFETY: `raw` is a valid pointer to a nullable `*const CFArray`.
-        let error = unsafe {
-            self.inner.copy_action_names(
-                NonNull::new(&raw as *const _ as *mut *const CFArray)
-                    .expect("address of a local is never null"),
-            )
-        };
+        let error = unsafe { self.inner.copy_action_names(NonNull::from(&mut raw)) };
         if error != AXError::Success || raw.is_null() {
             return Vec::new();
         }
@@ -254,11 +286,29 @@ impl Element {
             let Some(pointer) = NonNull::new(raw.cast_mut()) else {
                 continue;
             };
-            // SAFETY: borrowed reference from CFArray, retained before use.
-            let text = unsafe { CFRetained::retain(pointer.cast::<CFString>()) };
+            // SAFETY: borrowed reference from CFArray, retained before a
+            // checked downcast. A malformed provider cannot make us treat an
+            // arbitrary CF object as a string.
+            let value = unsafe { CFRetained::retain(pointer.cast::<CFType>()) };
+            let Ok(text) = value.downcast::<CFString>() else {
+                continue;
+            };
             out.push(text.to_string());
         }
         out
+    }
+
+    /// Whether an attribute can be changed on this exact element.
+    #[must_use]
+    pub fn is_settable(&self, name: &str) -> bool {
+        let key = CFString::from_str(name);
+        let mut settable = 0;
+        // SAFETY: `settable` is a valid out pointer and `key` is live.
+        let result = unsafe {
+            self.inner
+                .is_attribute_settable(&key, NonNull::from(&mut settable))
+        };
+        result == AXError::Success && settable != 0
     }
 
     /// Performs an action by its `AX` name.
@@ -282,6 +332,11 @@ impl Element {
 
     /// Sets a string attribute, such as `AXValue` on a text field.
     pub fn set_string(&self, name: &str, value: &str) -> Result<()> {
+        if !self.is_settable(name) {
+            return Err(DesktopError::invalid_argument(format!(
+                "this element does not accept text through {name}"
+            )));
+        }
         let key = CFString::from_str(name);
         let text = CFString::from_str(value);
         // SAFETY: both the key and the value are live for the call.

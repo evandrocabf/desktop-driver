@@ -628,7 +628,7 @@ impl CapturePort for PortalCapture {
     /// user's Pictures directory or a temporary file, and leaving a copy behind
     /// on every screenshot would be a surprise.
     fn capture(&self, target: &CaptureTarget) -> Result<Image> {
-        if let CaptureTarget::Window(_) = target {
+        if matches!(target, CaptureTarget::Window(_) | CaptureTarget::App(_)) {
             return Err(DesktopError::unsupported(
                 desktop_core::models::capability::Capability::WindowScreenshots,
                 self.info.screenshot,

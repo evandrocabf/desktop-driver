@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Interactive macOS installs now request Accessibility, Screen Recording and Post Events through
+  the installed CLI, wait for the user to approve macOS's native dialogs, and verify the grants.
+  Non-interactive installs skip the prompts, and `--no-setup` provides an explicit opt-out.
+- Browser daemon sockets fall back to a short, private runtime path when macOS's long per-user
+  temporary directory would exceed the platform's Unix socket path limit.
+- macOS window ids now preserve the Core Graphics id used by ScreenCaptureKit, `screenshot --app`
+  resolves the named application, saved elements re-resolve the recorded app/window and act on the
+  same role/name-validated AX handle, and capture no longer depends on Accessibility permission.
+- macOS capture selects the primary display explicitly, renders at the display's backing scale, and
+  preserves ScreenCaptureKit error details. Text input no longer splits surrogate pairs or injects a
+  zero-width character; it emits matching key-up events, layout-independent character shortcuts,
+  and correct multi-click state.
+- macOS accessibility walks apply the timeout to every AX element, bound large child arrays before
+  crossing the process boundary, recover labels from title elements and placeholders, and expose
+  checked/expanded/focusable state. Malformed AX arrays are ignored instead of unsafely cast.
+- macOS capture requests BGRA and the filter's actual backing scale explicitly, retains transparent
+  window pixels, and includes portions of windows positioned off-screen. CRLF text now produces one
+  Return event per logical newline.
+- `desktop setup` requests Accessibility, Screen Recording and Post Events; AXValue and focus calls
+  verify their result. Browser profile intermediate directories are tightened to `0700`.
+- macOS builds declare a 14.0 deployment floor. A strict, manually invoked AppKit E2E fixture
+  exercises the permissioned accessibility, input and capture paths on locally compiled binaries.
+
 ## [0.2.0] - 2026-08-22
 
 ### Added
@@ -28,7 +55,6 @@ All notable changes to this project are documented here. The format follows
   SIGINT/SIGTERM is handled so stopping a session also cleans up the managed Chromium child.
 
 ### Fixed
-
 - Browser navigation now waits for the new document loader, `networkidle` tracks CDP requests in
   flight, hover uses real pointer movement, and targeted typing verifies visibility, editability
   and focus before inserting text.
@@ -61,11 +87,9 @@ binary and links the agent skill into whichever coding agents are present.
   invisible, marked `"accessible": false`: it can be screenshotted and clicked by coordinate, and
   `desktop snapshot` on it refuses instead of inventing an empty tree. Under Wayland the list still
   comes from AT-SPI frames, which is all a client there can see.
-- **Installation in one line** — `curl -fsSL .../install.sh | bash`, needing only curl and tar. The
-  source arrives as a tarball where git is absent, and the binary is downloaded from the matching
-  release and verified against its published SHA-256, falling back to a source build where no
-  release covers the platform. Releases are built for x86_64 and aarch64 Linux (static musl) and
-  both macOS architectures by `.github/workflows/release.yml` on a `v*` tag.
+- **Installation in one line** — `curl -fsSL .../install.sh | bash`. The source arrives as a tarball
+  where git is absent. macOS always builds that repository locally; Linux may use an
+  existing matching release after verifying its published SHA-256, with a source-build fallback.
 - **Reliable updates.** `install.sh --update` refreshes both Git and tarball checkouts, verifies that
   a downloaded or built binary matches the source version, atomically replaces an installer-owned
   binary, refreshes copied skills, and leaves persistent browser profiles outside the checkout.

@@ -153,12 +153,47 @@ impl Driver {
     }
 
     pub fn screenshot(&self, target: &CaptureTarget) -> Result<Image> {
-        self.policy.check(Action::Screenshot, None)?;
         let capability = match target {
             CaptureTarget::Screen => Capability::Screenshots,
-            CaptureTarget::Window(_) => Capability::WindowScreenshots,
+            CaptureTarget::Window(_) | CaptureTarget::App(_) => Capability::WindowScreenshots,
         };
         self.require(capability, self.info().screenshot)?;
+        match target {
+            CaptureTarget::App(name) => match self.ports.capture.resolve_app(name)? {
+                Some(app) => self.policy.check(Action::Screenshot, Some(&app))?,
+                None if self.policy.has_app_scope() => {
+                    return Err(DesktopError::PolicyDenied {
+                        action: Action::Screenshot.as_str().to_owned(),
+                        subject: format!(
+                            "application {name:?} could not be resolved for --allow-app/--deny-app"
+                        ),
+                    });
+                }
+                None => self.policy.check(Action::Screenshot, None)?,
+            },
+            CaptureTarget::Window(id) if self.policy.has_app_scope() => {
+                let app = self.ports.capture.resolve_window_app(*id)?.ok_or_else(|| {
+                    DesktopError::PolicyDenied {
+                        action: Action::Screenshot.as_str().to_owned(),
+                        subject: format!(
+                            "window {id} could not be resolved for --allow-app/--deny-app"
+                        ),
+                    }
+                })?;
+                self.policy.check(Action::Screenshot, Some(&app))?;
+            }
+            CaptureTarget::Screen if self.policy.has_app_scope() => {
+                return Err(DesktopError::PolicyDenied {
+                    action: Action::Screenshot.as_str().to_owned(),
+                    subject:
+                        "an unscoped screenshot cannot be checked against --allow-app/--deny-app"
+                            .to_owned(),
+                });
+            }
+            CaptureTarget::Screen | CaptureTarget::Window(_) => {
+                self.policy.check(Action::Screenshot, None)?;
+            }
+        }
         self.ports.capture.capture(target)
     }
 
@@ -660,6 +695,45 @@ mod tests {
         let (driver, _) = driver_with("deny-snapshot", FakePorts::new(), policy);
         let error = driver
             .snapshot(&Target::Focused, WalkBudget::default(), false)
+            .expect_err("must deny");
+        assert!(matches!(error, DesktopError::PolicyDenied { .. }));
+    }
+
+    #[test]
+    fn a_denied_app_cannot_be_screenshotted_by_name() {
+        let policy = Policy {
+            deny_apps: vec!["Fixture".to_owned()],
+            ..Policy::default()
+        };
+        let (driver, _) = driver_with("deny-app-shot", FakePorts::new(), policy);
+        let error = driver
+            .screenshot(&CaptureTarget::App("Fixture".to_owned()))
+            .expect_err("must deny");
+        assert!(matches!(error, DesktopError::PolicyDenied { .. }));
+    }
+
+    #[test]
+    fn an_app_scoped_policy_refuses_a_screen_capture_it_cannot_attribute() {
+        let policy = Policy {
+            allow_apps: vec!["Fixture".to_owned()],
+            ..Policy::default()
+        };
+        let (driver, _) = driver_with("unscoped-shot", FakePorts::new(), policy);
+        let error = driver
+            .screenshot(&CaptureTarget::Screen)
+            .expect_err("must fail closed");
+        assert!(matches!(error, DesktopError::PolicyDenied { .. }));
+    }
+
+    #[test]
+    fn a_window_screenshot_is_checked_against_its_resolved_owner() {
+        let policy = Policy {
+            deny_apps: vec!["Fixture".to_owned()],
+            ..Policy::default()
+        };
+        let (driver, _) = driver_with("deny-window-shot", FakePorts::new(), policy);
+        let error = driver
+            .screenshot(&CaptureTarget::Window(crate::models::ids::WindowId::new(0)))
             .expect_err("must deny");
         assert!(matches!(error, DesktopError::PolicyDenied { .. }));
     }

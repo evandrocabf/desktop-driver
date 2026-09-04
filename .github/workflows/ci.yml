@@ -44,7 +44,13 @@ jobs:
   # this job is the only thing standing between "compiles in theory" and
   # "compiles". It builds the real binary and runs the platform-free tests.
   macos:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -54,6 +60,8 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets
+      - name: binary declares the supported deployment floor
+        run: vtool -show-build ./target/debug/desktop | grep -Eq 'minos 14([.]0+)?$'
       # Runs without any TCC grant, which is exactly the state a fresh machine
       # is in: these three must explain themselves rather than fail.
       - name: describe-only commands work unprivileged
@@ -69,6 +77,24 @@ jobs:
           if ./target/debug/desktop session start; then
             echo "session start should have failed on macOS"; exit 1
           fi
+      - name: browser-native automation works on macOS
+        run: |
+          set -eu
+          D=./target/debug/desktop
+          PROFILE="ci-${RUNNER_ARCH}"
+          cleanup() { "$D" --json browser close --profile "$PROFILE" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT INT TERM
+          "$D" --json browser doctor --profile "$PROFILE"
+          "$D" --json browser open \
+            "file://${GITHUB_WORKSPACE}/tests/fixtures/browser/macos-smoke.html" \
+            --headless --profile "$PROFILE"
+          "$D" --json browser wait --load domcontentloaded --timeout 10000 --profile "$PROFILE"
+          "$D" --json browser snapshot --interactive --profile "$PROFILE"
+          "$D" --json browser fill 'css=input' 'macOS browser ✓' --profile "$PROFILE"
+          "$D" --json browser click 'css=button' --profile "$PROFILE"
+          "$D" --json browser wait --text 'macOS browser ✓' --timeout 10000 --profile "$PROFILE"
+          "$D" --json browser get text 'css=output' --profile "$PROFILE" | tee /tmp/browser-get.json
+          grep -Fq 'macOS browser ✓' /tmp/browser-get.json
 
   # The agent-session path end to end, in a container with no desktop at all.
   session:

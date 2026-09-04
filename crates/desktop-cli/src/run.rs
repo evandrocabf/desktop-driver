@@ -419,7 +419,7 @@ fn target_of(args: &TargetArgs) -> Target {
 fn capture_target_of(args: &TargetArgs) -> CaptureTarget {
     match args.window {
         Some(id) => CaptureTarget::Window(WindowId::new(id)),
-        None if args.app.is_some() => CaptureTarget::Window(WindowId::new(0)),
+        None if args.app.is_some() => CaptureTarget::App(args.app.clone().unwrap_or_default()),
         None => CaptureTarget::Screen,
     }
 }
@@ -432,7 +432,7 @@ fn budget_of(args: &BudgetArgs) -> WalkBudget {
     }
 }
 
-/// Walks the user through the one-time grant Wayland needs.
+/// Walks the user through the one-time grants the selected backend needs.
 fn setup(driver: &Driver, sink: &mut Sink<'_>) -> Result<()> {
     let permissions = driver.request_permissions();
     let capabilities = driver.capabilities();
@@ -476,6 +476,17 @@ pub(crate) fn severity_rank(severity: Severity) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_app_target_preserves_the_application_name() {
+        assert_eq!(
+            capture_target_of(&TargetArgs {
+                app: Some("Calculator".to_owned()),
+                window: None,
+            }),
+            CaptureTarget::App("Calculator".to_owned())
+        );
+    }
     use crate::cli::Cli;
     use clap::Parser as _;
     use desktop_core::{

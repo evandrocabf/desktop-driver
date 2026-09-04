@@ -23,12 +23,17 @@ pub mod attribute {
     pub const DESCRIPTION: &str = "AXDescription";
     pub const HELP: &str = "AXHelp";
     pub const VALUE: &str = "AXValue";
+    pub const PLACEHOLDER_VALUE: &str = "AXPlaceholderValue";
+    pub const TITLE_UI_ELEMENT: &str = "AXTitleUIElement";
     pub const CHILDREN: &str = "AXChildren";
     pub const WINDOWS: &str = "AXWindows";
     pub const MAIN_WINDOW: &str = "AXMainWindow";
+    pub const FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const FOCUSED: &str = "AXFocused";
     pub const ENABLED: &str = "AXEnabled";
     pub const SELECTED: &str = "AXSelected";
+    pub const EXPANDED: &str = "AXExpanded";
+    pub const DISCLOSING: &str = "AXDisclosing";
     pub const POSITION: &str = "AXPosition";
     pub const SIZE: &str = "AXSize";
     pub const FRONTMOST: &str = "AXFrontmost";
@@ -56,6 +61,8 @@ mod tests {
             attribute::TITLE,
             attribute::CHILDREN,
             attribute::VALUE,
+            attribute::PLACEHOLDER_VALUE,
+            attribute::TITLE_UI_ELEMENT,
             attribute::POSITION,
             attribute::SIZE,
         ] {
@@ -77,10 +84,14 @@ mod tests {
             attribute::TITLE,
             attribute::DESCRIPTION,
             attribute::VALUE,
+            attribute::PLACEHOLDER_VALUE,
+            attribute::TITLE_UI_ELEMENT,
             attribute::CHILDREN,
             attribute::WINDOWS,
             attribute::POSITION,
             attribute::SIZE,
+            attribute::EXPANDED,
+            attribute::DISCLOSING,
         ];
         let mut sorted = names.to_vec();
         sorted.sort_unstable();

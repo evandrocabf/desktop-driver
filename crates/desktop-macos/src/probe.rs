@@ -75,12 +75,14 @@ impl PlatformProbe for MacosProbe {
         diagnostics()
     }
 
-    /// Shows the Accessibility prompt if it has never been shown.
+    /// Requests all three independent TCC grants macOS exposes for this tool.
     ///
     /// macOS displays it once per TCC entry and silently declines afterwards,
     /// so the remedy text remains the real fallback.
     fn request_permissions(&self) -> Vec<PermissionState> {
         let _ = crate::ax::is_trusted_with_prompt(true);
+        let _ = objc2_core_graphics::CGRequestScreenCaptureAccess();
+        let _ = objc2_core_graphics::CGRequestPostEventAccess();
         self.permissions()
     }
 }

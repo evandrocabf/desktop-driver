@@ -129,6 +129,17 @@ back.
 Set `DESKTOP_DRIVER_LIVE_ON_MY_DESKTOP=1` to launch onto your own screen anyway. On macOS that is
 the only option, because there is no session mechanism and the only display is yours.
 
+Set `DESKTOP_DRIVER_LIVE_REQUIRED=1` when environmental prerequisites must fail instead of
+skipping. On macOS, build the repository locally, grant Accessibility, Screen Recording and event
+posting to the terminal or app that launches it, then run:
+
+```bash
+DESKTOP_DRIVER_BINARY="$PWD/target/release/desktop" scripts/macos-e2e.sh
+```
+
+Run that check on every macOS version and architecture whose native behavior you claim. There is no
+automated release pipeline and the repository requires no Apple signing or notarization secrets.
+
 `cargo xtask architecture` keeps both halves of this true: it fails if a test in `live.rs` loses its
 `#[ignore]`, and if any other test spawns a process.
 

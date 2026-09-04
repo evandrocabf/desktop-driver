@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>desktop-driver browser smoke</title>
+  </head>
+  <body>
+    <label>Value <input id="value"></label>
+    <button id="commit" type="button">Commit</button>
+    <output id="result"></output>
+    <script>
+      document.querySelector('#commit').addEventListener('click', () => {
+        document.querySelector('#result').textContent =
+          document.querySelector('#value').value;
+      });
+    </script>
+  </body>
+</html>

@@ -75,6 +75,20 @@ static ONE_CALCULATOR_AT_A_TIME: Mutex<()> = Mutex::new(());
 /// question worth asking before setting it. On macOS it is the only way to run
 /// these at all: there is no session mechanism, and the only display is yours.
 const LAUNCH_ON_MY_DESKTOP: &str = "DESKTOP_DRIVER_LIVE_ON_MY_DESKTOP";
+/// Turns every environmental skip into a hard CI failure.
+const LIVE_REQUIRED: &str = "DESKTOP_DRIVER_LIVE_REQUIRED";
+
+fn live_required() -> bool {
+    std::env::var_os(LIVE_REQUIRED).is_some()
+}
+
+fn unavailable(reason: impl std::fmt::Display) -> Option<Calculator> {
+    if live_required() {
+        panic!("required live test cannot run: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+    None
+}
 
 /// The display of the agent session, if one is running.
 #[cfg(target_os = "linux")]
@@ -149,8 +163,7 @@ impl Calculator {
     /// an order of magnitude between a warm and a cold page cache.
     fn launch() -> Option<Self> {
         if let Some(reason) = reason_not_to_launch() {
-            eprintln!("skipping: {reason}");
-            return None;
+            return unavailable(reason);
         }
 
         let serialized = ONE_CALCULATOR_AT_A_TIME
@@ -158,8 +171,7 @@ impl Calculator {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let Some(ports) = platform_ports() else {
-            eprintln!("skipping: no platform backend on this target");
-            return None;
+            return unavailable("no platform backend on this target");
         };
 
         let mut child = match Command::new(CALCULATOR_COMMAND)
@@ -169,8 +181,7 @@ impl Calculator {
         {
             Ok(child) => child,
             Err(error) => {
-                eprintln!("skipping: cannot start {CALCULATOR_COMMAND}: {error}");
-                return None;
+                return unavailable(format!("cannot start {CALCULATOR_COMMAND}: {error}"));
             }
         };
 
@@ -203,11 +214,10 @@ impl Calculator {
         let _ = child.kill();
         let _ = child.wait();
         let _ = driver.store().clear();
-        eprintln!(
-            "skipping: {CALCULATOR_COMMAND} started but never reached the accessibility bus \
-             within {LAUNCH_TIMEOUT:?}"
-        );
-        None
+        unavailable(format!(
+            "{CALCULATOR_COMMAND} started but never reached the accessibility bus within \
+             {LAUNCH_TIMEOUT:?}"
+        ))
     }
 
     fn press(&self, label: &str) -> bool {
@@ -328,6 +338,10 @@ fn a_snapshot_of_a_real_application_is_smaller_than_its_raw_tree() {
 /// The claim and the behaviour must not disagree in either direction.
 fn capabilities_agree_with_what_the_backends_actually_do() {
     let Some(ports) = platform_ports() else {
+        assert!(
+            !live_required(),
+            "required live test has no platform backend"
+        );
         eprintln!("skipping: no platform backend on this target");
         return;
     };

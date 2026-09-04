@@ -95,10 +95,7 @@ pub fn wait_for_socket(socket: &Path) -> BrowserResult<()> {
 pub fn run_daemon(options: DaemonOptions) -> BrowserResult<()> {
     let paths = profile_paths(&options.profile)?;
     if let Some(parent) = paths.socket.parent() {
-        std::fs::create_dir_all(parent).map_err(io_error)?;
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .map_err(io_error)?;
+        crate::paths::ensure_private_dir(parent)?;
     }
     if paths.socket.exists() {
         if UnixStream::connect(&paths.socket).is_ok() {

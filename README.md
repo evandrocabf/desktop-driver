@@ -412,13 +412,12 @@ uses portals.
 curl -fsSL https://raw.githubusercontent.com/evandrocabf/desktop-driver/main/install.sh | bash
 ```
 
-That needs `curl` and `tar` and nothing else. It takes the shortest route
-available on your machine and tells you which one it took: the source arrives as
-a tarball when `git` is missing and as a clone when it is not, and the binary is
-downloaded from the matching release — verified against its published SHA-256 —
-falling back to `cargo build` when this platform has no release or you asked for
-`--from-source`. A checksum that does not match is fatal rather than a reason to
-compile instead.
+The source arrives as a tarball when `git` is missing and as a clone when it is
+not. On macOS the installer always compiles that repository locally, so it
+requires Cargo/Rust; it never downloads a prebuilt Mac binary. On Linux it may
+use an existing matching release — verified against its
+published SHA-256 — and otherwise falls back to `cargo build`. A checksum that
+does not match is fatal rather than a reason to compile instead.
 
 From a checkout it always builds *that* checkout, which is what you want when
 you are working on it:
@@ -438,13 +437,20 @@ them are found. It names everything it writes as it writes it; `--dry-run`
 shows the plan without touching anything and `--uninstall` removes exactly what
 it added.
 
+On an interactive macOS install, the final step runs the installed binary's
+`desktop setup` command. macOS presents its native permission UI; approve the
+requests, then press Return in the installer so it can verify the grants. The
+installer cannot approve privacy permissions itself. Automated installs skip
+this interactive step, and `--no-setup` skips it explicitly.
+
 ```bash
 ./install.sh --dry-run               # see the plan first
 ./install.sh --project .             # install into this project instead of $HOME
 ./install.sh --agents codex,cursor   # pick the agents yourself
 ./install.sh --all                   # every known agent, detected or not
 ./install.sh --no-agents             # just the binary
-./install.sh --from-source           # compile, even where a release exists
+./install.sh --no-setup              # skip macOS permission prompts
+./install.sh --from-source           # compile, even where a release exists (automatic on macOS)
 ./install.sh --static                # a musl binary that runs on any Linux
 ./install.sh --update                # refresh checkout, binary and installed skills
 ./install.sh --uninstall
@@ -458,11 +464,9 @@ that the replacement binary reports the same version as the fetched source
 before replacing the installed executable, and leaves persistent browser
 profiles outside the checkout untouched.
 
-Version `0.1.0` was the first release; the current source version is `0.2.0`. Releases are built by
-`.github/workflows/release.yml` when a matching `v*` tag is pushed:
-static musl binaries for x86_64 and aarch64 Linux, and both macOS
-architectures, each with a `.sha256` beside it. When a matching release asset does not exist, the
-installer compiles from source — the same fallback used on platforms the matrix does not cover.
+Version `0.1.0` was the first release; the current source version is `0.2.0`.
+There is currently no automated release or binary-publication pipeline. The
+supported macOS installation path is a local build from this repository.
 
 Or build it yourself — Rust 1.97.1, pinned in `rust-toolchain.toml`:
 
@@ -497,19 +501,18 @@ application onto it, reads its accessibility tree and captures the screen:
 | Ubuntu 24.04 | ✓ | ✓ | ✓ | ✓ |
 | Arch | ✓ | ✓ | ✓ | ✓ |
 | openSUSE Tumbleweed | ✓ | ✓ | ✓ | ✓ |
-| macOS 14 | ✓ | refused, as it should be | — | — |
+| macOS hosted (Apple silicon + Intel) | ✓ | refused, as it should be | no TCC | no TCC |
 
 The Linux rows are containers with no systemd, no desktop and no login session,
 which is a harsher environment than a real machine and the same one CI runs in.
 
-The macOS row is a CI runner, and it is deliberately narrow. What it proves is
-that the binary builds and links for real, that `info`, `capabilities` and
-`doctor` answer with no permission granted — the state a fresh machine is in —
-and that `session start` refuses rather than half-working, since macOS has no
-mechanism to give an agent a display of its own. What it does not prove is the
-part that needs a human: **no snapshot, click or capture has ever run against a
-real Mac application**, because all three need a TCC grant that cannot be
-approved unattended. Treat the macOS backend as unverified where it matters.
+The hosted macOS row proves clean-machine behavior without TCC grants. For a
+native check, build locally, grant the three permissions to the terminal or app
+running the binary, and run `scripts/macos-e2e.sh`. It builds a deterministic
+AppKit fixture and verifies app/window identity across CLI processes, tree
+reads, AX actions, exact AXValue read-back, focus, pointer input, Unicode
+keyboard input, and screen/app/window capture. Missing permissions or desktop
+capabilities fail the script instead of becoming a successful skip.
 
 ### One binary for every distribution
 
@@ -526,13 +529,10 @@ version of the machine that produced it: one built on Fedora 43 requires
 `GLIBC_2.39` and will not start on Debian 12 or Ubuntu 22.04. The musl build has
 no such floor, and the session path was verified with it.
 
-**macOS has not been run on hardware.** It type-checks and lints clean for both
-`aarch64-apple-darwin` and `x86_64-apple-darwin`, and the known traps are
-handled in code — the `kAX*` string constants are declared locally because the
-generated bindings omit them, the messaging timeout is bounded so a hung
-application cannot wedge a traversal, Unicode input is chunked at the 20-unit
-limit, and all three TCC grants are preflighted. None of that is a substitute
-for running it. Treat macOS as unverified until it has been.
+The repository does not infer native compatibility from cross-compilation.
+Run `scripts/macos-e2e.sh` on every macOS version and architecture for which you
+want native evidence. Missing WindowServer access, TCC grants, fixture controls
+or capture output fails the check instead of turning it into a successful skip.
 
 ### Linux
 
@@ -600,13 +600,20 @@ Three separate permissions, with separate prompts:
   capabilities` preflights it separately and reports `mouse`, `keyboard` and
   `scroll` as unavailable rather than letting them fail silently.
 
+Interactive macOS installs run `desktop setup` automatically after installing
+the binary, wait for you to approve the native dialogs, and then verify the
+result. You can also run `desktop setup` later. macOS owns the dialogs; the tool
+cannot approve them and never reads or types authentication material.
+
 The one that confuses everyone: a command-line tool inherits the permission of
 **the terminal that launched it**. Grant access to iTerm2 / Ghostty / Terminal,
 not to `desktop`. The error message names the launching application for you.
 
-TCC also identifies a binary by its code signature, so an unsigned build gets a
-new identity on every `cargo build` and silently loses the grant. Sign with a
-stable identity, or run one installed copy.
+TCC can also use code identity when deciding whether a grant still applies.
+For local development, install and run one stable compiled copy; after replacing
+it, rerun `desktop setup` if macOS no longer recognizes the previous grant. An
+embedding application can sign the helper with its own existing app-signing
+process, but desktop-driver itself requires no signing credentials.
 
 ---
 
@@ -666,7 +673,10 @@ desktop --host screenshot                # your desktop, ignoring the session
 
 `cmd` means the Command/Super key on both platforms — it is never silently
 rewritten to Ctrl. Use `accel` for "this platform's menu modifier": Command on
-macOS, Ctrl on Linux.
+macOS, Ctrl on Linux. On macOS, character shortcuts carry their Unicode value
+with the modifier mask, so `accel+s` does not assume a US physical layout;
+only non-text keys such as Return, arrows and function keys use fixed Apple
+virtual keycodes.
 
 ### Exit codes
 
@@ -809,6 +819,12 @@ assert the display reads `10`.
 ```bash
 cargo test --workspace -- --ignored
 ```
+
+Set `DESKTOP_DRIVER_LIVE_REQUIRED=1` in automation. With it, a missing display,
+permission, backend, application, or accessibility tree is a test failure, not
+a skip. The complete macOS native fixture is run with `scripts/macos-e2e.sh`;
+it requires a dedicated logged-in Mac because macOS cannot create a second
+WindowServer session for an agent.
 
 ---
 
